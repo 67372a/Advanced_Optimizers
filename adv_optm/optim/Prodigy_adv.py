@@ -39,16 +39,26 @@ class Prodigy_adv(torch.optim.Optimizer):
             applied only to parameter coordinates where the sign of the parameter
             and the sign of the optimizer update align (default: False).
         vector_reshape (bool): whether to reshape 1D vectors into 2D
-            matrices to apply low-rank compression (default: True).
+            matrices to apply low-rank compression (default: False).
         stochastic_rounding (bool): whether to use stochastic
             rounding for BF16 parameter updates (default: True).
         use_atan2 (bool): whether to use the atan2 update rule. (default: False)
         orthogonal_gradient (str): whether to use OrthoGrad variants. 'disabled': off.
         'flattened': Standard vectorized OrthoGrad. 'iterative': Matrix-wise rank-2 OrthoGrad. (default: disabled)
+        nesterov (bool): enables Nesterov momentum (default: False).
+        nesterov_coef (float | None): Nesterov lookahead coefficient. Defaults to
+            the momentum value when None (default: None).
+        state_precision (str): Precision method for Prodigy states. Options: 'auto'
+            (parameter precision), 'fp32', 'factored' (SMMF low-rank FP32), 'bf16_sr' (with
+            stochastic rounding), 'fp16', 'int8_sr'. (default: 'auto')
+        compiled_optimizer (bool): compile the core step function with torch.compile
+            for faster execution (default: False).
         nnmf_factor (bool): whether to use the factorization or disable it to use
             the uncompressed optimizer. (default: False)
         factored_2nd (bool): whether to keep the first moment uncompressed (dense)
-            while only factorizing the second moment. (default: True)
+            while only factorizing the second moment. (default: False)
+        beta3 (float): The exponential decay rate for the D-estimate moving average.
+            When None, it defaults to `sqrt(betas[1])`. (default: None)
         d0 (float):
             Initial D estimate for D-adaptation (default 1e-6). Rarely needs changing.
         d_coef (float):
@@ -59,10 +69,13 @@ class Prodigy_adv(torch.optim.Optimizer):
             prevent the D estimate from growing faster than this multiplicative rate.
             Default is inf, for unrestricted. Values like 1.02 give a kind of learning
             rate warmup effect.
+        safeguard_warmup (bool): whether to keep the D estimate at d0 during the
+            warmup phase to avoid premature adaptation (default: False).
         fsdp_in_use (bool):
             If you're using sharded parameters, this should be set to True. The optimizer
             will attempt to auto-detect this, but if you're using an implementation other
             than PyTorch's builtin version, the auto-detection won't work.
+            (default: False)
         slice_p (int): Reduce memory usage by calculating LR adaptation statistics on only every
             pth entry of each tensor. For values greater than 1 this an an approximation to standard
             Prodigy. Values ~11 are reasonable (default 11).
@@ -76,10 +89,10 @@ class Prodigy_adv(torch.optim.Optimizer):
             If `False`, the optimizer behaves as standard AdamW/Prodigy. (default: False)
         beta2_min (float): The minimum value for dynamic β₂, used during periods of
             high gradient variance ("sunspikes"). Must be less than `betas[1]`.
-            (default: 0.88)
+            (default: 0.9)
         ema_alpha (float): The decay rate for the Exponential Moving Average (EMA) of
             the pooled gradient norms. Corresponds to `α` in the paper.
-            (default: 0.93)
+            (default: 0.95)
         tiny_spike (float): A small constant added to the denominator of the
             "sunspike" ratio calculation to prevent division by zero. Corresponds
             to `ε_spike` in the paper. (default: 1e-9)
@@ -103,6 +116,9 @@ class Prodigy_adv(torch.optim.Optimizer):
             'float8': Uses torch.float8_e4m3fn for a balance of precision and memory.
             'int8': Uses 8-bit block-wise quantization (block size 128).
             'int4': Uses 4-bit block-wise quantization (block size 32).
+            (default: 'float8')
+        spectral_normalization (bool): Enable explicit spectral normalization using
+            power iteration (default: False).
     """
 
     def __init__(

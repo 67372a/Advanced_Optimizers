@@ -25,12 +25,14 @@ class Muon_adv(torch.optim.Optimizer):
         params (iterable): iterable of parameters to optimize or dicts defining
             parameter groups.
         lr (float): learning rate (default: 1e-3).
-        beta1 (float): momentum factor (default: 0.9).
-        weight_decay (float): weight decay (L2 penalty) (default: 0).
+        beta1 (float): momentum factor (default: 0.95).
+        weight_decay (float): weight decay (L2 penalty) (default: 0.0).
         cautious_wd (bool): Enables Cautious Weight Decay. If True, weight decay is
             applied only to parameter coordinates where the sign of the parameter
             and the sign of the optimizer update align (default: False).
         nesterov (bool): enables Nesterov momentum (default: True).
+        nesterov_coef (float | None): Nesterov lookahead coefficient. Defaults to
+            the momentum value when None (default: None).
         ns_steps (int): number of Newton-Schulz iterations to perform (default: 5).
         ns_eps (float): epsilon for Newton-Schulz normalization stability. When None
             it's derived from scale invariant rule (default: 1e-7).
@@ -42,13 +44,18 @@ class Muon_adv(torch.optim.Optimizer):
         orthogonal_gradient (str): whether to use OrthoGrad variants. 'disabled': off.
         'flattened': Standard vectorized OrthoGrad. 'iterative': Matrix-wise rank-2 OrthoGrad. (default: disabled)
         vector_reshape (bool): whether to reshape 1D vectors into 2D
-            matrices to apply low-rank compression (default: True).
+            matrices to apply low-rank compression (default: False).
         nnmf_factor (bool): whether to use the factorization or disable it to use
             the uncompressed optimizer. (default: False)
         use_muon (bool | None): whether to use Muon or AuxAdamW. MUST be provided
             either here or via `optim_type` in parameter groups. (default: None)
+        min_dim_size (int): minimum dimension size required for a parameter to be
+            considered suitable for Muon when auto-detecting (default: 4).
+        max_aspect_ratio (float): maximum allowed aspect ratio (max_dim / min_dim)
+            for a parameter to be considered suitable for Muon when auto-detecting
+            (default: 128.0).
         state_precision (str): Precision for Muon optimizer states. Options: 'auto' (parameter dtype), 'fp32',
-            'bf16_sr' (BF16 with stochastic rounding), 'int8_sr'.
+            'factored' (SMMF low-rank FP32), 'bf16_sr' (BF16 with stochastic rounding), 'fp16', 'int8_sr'.
             (default: 'auto')
         low_rank_ortho (bool): If True, enables low-rank orthogonalization, which
             projects the update to a lower rank before orthogonalization.
@@ -68,7 +75,7 @@ class Muon_adv(torch.optim.Optimizer):
         cns_a_bound (float): Initial lower bound for singular values for CANS. When None
             it's derived from scale invariant rule (default: None).
         approx_mars (bool): If True, enables Approximated MARS-M variance reduction.
-        fom the paper "MARS-M: When Variance Reduction Meets Matrices"
+            from the paper "MARS-M: When Variance Reduction Meets Matrices"
             (default: False)
         mars_gamma (float): The scaling coefficient for MARS gradient correction.
             (default: 0.025)
@@ -81,25 +88,28 @@ class Muon_adv(torch.optim.Optimizer):
             'float8': Uses torch.float8_e4m3fn for a balance of precision and memory.
             'int8': Uses 8-bit block-wise quantization (block size 128).
             'int4': Uses 4-bit block-wise quantization (block size 32).
+            (default: 'float8')
         spectral_normalization (bool): Enable explicit spectral normalization using power iteration. (default: False)
+        compiled_optimizer (bool): compile the core step function with torch.compile
+            for faster execution (default: False).
         --- Auxiliary AdamW_adv Parameters (used for 'adam' groups) ---
-        adam_betas (tuple[float, float]): Betas for the AdamW optimizer part.
-        adam_eps (float): Epsilon for the AdamW optimizer part.
-        adam_weight_decay (float): Weight decay for the AdamW optimizer part.
+        adam_betas (tuple[float, float]): Betas for the AdamW optimizer part. (default: (0.9, 0.99))
+        adam_eps (float): Epsilon for the AdamW optimizer part. (default: 1e-8)
+        adam_weight_decay (float): Weight decay for the AdamW optimizer part. (default: 0.0)
         adam_fisher_wd (bool): Fisher Adam (FAdam) weight decay for the AdamW part. (default: False)
-        adam_use_bias_correction (bool): Bias correction for AdamW.
-        adam_use_atan2 (bool): Atan2 update rule for AdamW.
-        adam_orthogonal_gradient (str): OrthoGrad for AdamW.
+        adam_use_bias_correction (bool): Bias correction for AdamW. (default: True)
+        adam_use_atan2 (bool): Atan2 update rule for AdamW. (default: False)
+        adam_orthogonal_gradient (str): OrthoGrad for AdamW. (default: 'disabled')
         adam_nesterov (bool): Nesterov momentum for AdamW. (default: False)
         adam_nesterov_coef (float, optional): Nesterov coefficient for AdamW. (default: None)
-        adam_kourkoutas_beta (bool): Kourkoutas-β for AdamW.
+        adam_kourkoutas_beta (bool): Kourkoutas-β for AdamW. (default: False)
         adam_beta2_min (float): Minimum beta2 for Kourkoutas-β. (default: 0.9)
         adam_ema_alpha (float): EMA alpha for Kourkoutas-β. (default: 0.95)
         adam_tiny_spike (float): Tiny spike for Kourkoutas-β. (default: 1e-9)
         adam_k_warmup_steps (int): Warmup steps for Kourkoutas-β. (default: 0)
         adam_spectral_normalization (bool): Enable explicit spectral normalization for AdamW. (default: False)
         adam_state_precision (str): Precision for AuxAdam states. Options: 'auto', 'fp32', 'bf16_sr', 'fp16', 'int8_sr', 'factored'. (default: 'auto')
-        adam_nnmf_factor (bool): 1-bit factored for AdamW.
+        adam_nnmf_factor (bool): 1-bit factored for AdamW. (default: False)
         adam_factored_2nd (bool): Factorize only the second moment (v_t) for AuxAdam. (default: False)
         """
 
@@ -129,6 +139,9 @@ class Muon_adv(torch.optim.Optimizer):
         vector_reshape: bool = False,
         # Boolean to spilt param
         use_muon: bool | None = None,
+        # Muon suitability detection (auto-detect only)
+        min_dim_size: int = 4,
+        max_aspect_ratio: float = 128.0,
         # States precision (Muon path)
         state_precision: str = "auto",  # 'fp32', 'bf16_sr', 'int8_sr'
         # Low-rank Muon
@@ -206,6 +219,9 @@ class Muon_adv(torch.optim.Optimizer):
             "orthogonal_gradient": orthogonal_gradient,
             'compiled_optimizer': compiled_optimizer,
             "use_muon": use_muon,
+            # Muon suitability detection (auto-detect only)
+            "min_dim_size": min_dim_size,
+            "max_aspect_ratio": max_aspect_ratio,
             # States precision (Muon path)
             "state_precision": state_precision,
             # Low-rank Ortho
@@ -298,7 +314,11 @@ class Muon_adv(torch.optim.Optimizer):
         elif group.get('optim_type') is not None:
             state['is_muon'] = group['optim_type'] == 'muon'
         else: # Auto-detect per parameter
-            state['is_muon'] = _is_suitable_for_muon(p)
+            state['is_muon'] = _is_suitable_for_muon(
+                p,
+                group['min_dim_size'],
+                group['max_aspect_ratio'],
+            )
 
         if state['is_muon']:
 

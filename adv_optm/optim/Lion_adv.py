@@ -29,10 +29,12 @@ class Lion_adv(torch.optim.Optimizer):
             applied only to parameter coordinates where the sign of the parameter
             and the sign of the optimizer update align (default: False).
         vector_reshape (bool, optional): whether to reshape 1D vectors into 2D
-            matrices to apply low-rank compression (default: True).
+            matrices to apply low-rank compression (default: False).
         stochastic_rounding (bool, optional): whether to use stochastic
             rounding for BF16 parameter updates (default: True).
-        orthogonal_gradient (bool): whether to orthogonalize the gradient (default: False).
+        orthogonal_gradient (str): whether to use OrthoGrad variants. 'disabled': off.
+            'flattened': Standard vectorized OrthoGrad. 'iterative': Matrix-wise rank-2 OrthoGrad.
+            (default: 'disabled')
         kappa_p (float, optional): The p-value for the Lp-norm in Lion-K (domain [1.0, 2.0]).
             - 1.0: Standard Lion (sign update).
             - 2.0: Spherical Lion (normalized L2 update).
@@ -43,6 +45,8 @@ class Lion_adv(torch.optim.Optimizer):
             use Spherical updates, and p=1.0 for others (Linear/Embeddings) to use Sign
             updates. Overrides explicit kappa_p value. (default: False).
         stochastic_sign (bool): whether to use the Stochastic Sign operator. (default: False)
+        spectral_normalization (bool): Enable explicit spectral normalization using
+            power iteration (default: False).
         centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
             toward zero, they are decayed toward their initial values (anchors). This
             can be used together with standard weight decay. (default: 0.0)
@@ -52,8 +56,11 @@ class Lion_adv(torch.optim.Optimizer):
             'float8': Uses torch.float8_e4m3fn for a balance of precision and memory.
             'int8': Uses 8-bit block-wise quantization (block size 128).
             'int4': Uses 4-bit block-wise quantization (block size 32).
+            (default: 'float8')
         nnmf_factor (bool): whether to use the factorization or use the
-            uncompressed optimizer. (default: True)
+            uncompressed optimizer. (default: False)
+        compiled_optimizer (bool): compile the core step function with torch.compile
+            for faster execution (default: False).
     """
 
     def __init__(

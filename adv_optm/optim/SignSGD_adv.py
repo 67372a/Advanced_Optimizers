@@ -24,15 +24,29 @@ class SignSGD_adv(torch.optim.Optimizer):
         momentum (float, optional): coefficients for computing
             running average of the gradients (default: 0.9).
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0.0).
+        geometric_wd (bool): uses a structural weight-decay scaler that penalizes
+            dominant rows/columns more heavily (default: False).
         cautious_wd (bool): Enables Cautious Weight Decay. If True, weight decay is
             applied only to parameter coordinates where the sign of the parameter
             and the sign of the optimizer update align (default: False).
         vector_reshape (bool, optional): whether to reshape 1D vectors into 2D
-            matrices to apply low-rank compression (default: True).
+            matrices to apply low-rank compression (default: False).
         stochastic_rounding (bool, optional): whether to use stochastic
             rounding for BF16 parameter updates (default: True).
-        orthogonal_gradient (bool): whether to orthogonalize the gradient (default: False).
+        orthogonal_gradient (str): whether to use OrthoGrad variants. 'disabled': off.
+            'flattened': Standard vectorized OrthoGrad. 'iterative': Matrix-wise rank-2 OrthoGrad.
+            (default: 'disabled')
         stochastic_sign (bool): whether to use the Stochastic Sign operator. (default: False)
+        nesterov (bool): enables Nesterov momentum (default: False).
+        nesterov_coef (float | None): Nesterov lookahead coefficient. Defaults to
+            the momentum value when None (default: None).
+        normed_momentum (bool): normalize the gradient *before* it enters the
+            momentum buffer ("Normalization then Momentum") instead of after
+            (default: False).
+        snr_cond (bool): SNR preconditioning. Scales the update by the empirical
+            signal-to-noise ratio of the momentum buffer before applying the
+            atan bounding. Requires normed_momentum and momentum > 0
+            (default: False).
         centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
             toward zero, they are decayed toward their initial values (anchors). This
             can be used together with standard weight decay. (default: 0.0)
@@ -42,11 +56,16 @@ class SignSGD_adv(torch.optim.Optimizer):
             'float8': Uses torch.float8_e4m3fn for a balance of precision and memory.
             'int8': Uses 8-bit block-wise quantization (block size 128).
             'int4': Uses 4-bit block-wise quantization (block size 32).
-        state_precision (str): Precision method for Adopt states. Options: 'auto'
+            (default: 'float8')
+        state_precision (str): Precision method for SignSGD states. Options: 'auto'
             (parameter precision), 'fp32', 'factored' (SMMF low-rank FP32), 'bf16_sr' (with
             stochastic rounding), 'fp16' , 'int8_sr'. (default: 'auto')
+        spectral_normalization (bool): Enable explicit spectral normalization using
+            power iteration (default: False).
         nnmf_factor (bool): whether to use the factorization or use the
-            uncompressed optimizer. (default: True)
+            uncompressed optimizer. (default: False)
+        compiled_optimizer (bool): compile the core step function with torch.compile
+            for faster execution (default: False).
     """
 
     def __init__(

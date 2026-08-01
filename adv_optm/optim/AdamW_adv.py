@@ -41,21 +41,24 @@ class AdamW_adv(torch.optim.Optimizer):
             and second moment estimates, as in the original Adam paper.
             (default: True)
         vector_reshape (bool): whether to reshape 1D vectors into 2D
-            matrices to apply low-rank compression (default: True).
+            matrices to apply low-rank compression (default: False).
         stochastic_rounding (bool): whether to use stochastic
             rounding for BF16 parameter updates (default: True).
         use_atan2 (bool): whether to use the atan2 update rule. (default: False)
         orthogonal_gradient (str): whether to use OrthoGrad variants. 'disabled': off.
         'flattened': Standard vectorized OrthoGrad. 'iterative': Matrix-wise rank-2 OrthoGrad. (default: disabled)
+        nesterov (bool): enables Nesterov momentum (default: False).
+        nesterov_coef (float | None): Nesterov lookahead coefficient. Defaults to
+            the momentum value when None (default: None).
         normed_momentum (bool): whether to compute the first moment on the normalized gradient. (default: False)
         kourkoutas_beta (bool): whether to enable the layer-wise dynamic β₂ logic.
             If `False`, the optimizer behaves as standard AdamW. (default: False)
         beta2_min (float): The minimum value for dynamic β₂, used during periods of
             high gradient variance ("sunspikes"). Must be less than `betas[1]`.
-            (default: 0.88)
+            (default: 0.9)
         ema_alpha (float): The decay rate for the Exponential Moving Average (EMA) of
             the pooled gradient norms. Corresponds to `α` in the paper.
-            (default: 0.93)
+            (default: 0.95)
         tiny_spike (float): A small constant added to the denominator of the
             "sunspike" ratio calculation to prevent division by zero. Corresponds
             to `ε_spike` in the paper. (default: 1e-9)
@@ -70,6 +73,8 @@ class AdamW_adv(torch.optim.Optimizer):
             and returns a unique, hashable key representing its "layer" or "bucket".
             If `None`, parameters are bucketed by their memory ID (tensor-wise).
             (default: None)
+        spectral_normalization (bool): Enable explicit spectral normalization using
+            power iteration (default: False).
         centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
             toward zero, they are decayed toward their initial values (anchors). This
             can be used together with standard weight decay. (default: 0.0)
@@ -79,13 +84,16 @@ class AdamW_adv(torch.optim.Optimizer):
             'float8': Uses torch.float8_e4m3fn for a balance of precision and memory.
             'int8': Uses 8-bit block-wise quantization (block size 128).
             'int4': Uses 4-bit block-wise quantization (block size 32).
+            (default: 'float8')
         nnmf_factor (bool): whether to use the factorization or disable it to use
             the uncompressed optimizer. (default: False)
         factored_2nd (bool): whether to keep the first moment uncompressed (dense)
             while only factorizing the second moment. (default: False)
-        state_precision (str): Precision method for Adopt states. Options: 'auto'
+        state_precision (str): Precision method for AdamW states. Options: 'auto'
             (parameter precision), 'fp32', 'factored' (SMMF low-rank FP32), 'bf16_sr' (with
             stochastic rounding), 'fp16' , 'int8_sr'. (default: 'auto')
+        compiled_optimizer (bool): compile the core step function with torch.compile
+            for faster execution (default: False).
     """
 
     def __init__(
