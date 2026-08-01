@@ -332,7 +332,9 @@ class Muon_adv(torch.optim.Optimizer):
 
             # MARS-M state initialization
             if group.get('approx_mars', False):
-                # Note: This requires full-rank memory even if factored
+                # Note: This requires full-rank memory even if factored.
+                # Stored at the parameter's dtype; BF16 writes use stochastic rounding
+                # inside approx_mars to avoid biasing the variance-reduction signal.
                 state['last_grad'] = torch.zeros_like(p, device=device, dtype=p.dtype)
 
             # NorMuon state initialization
@@ -460,7 +462,18 @@ class Muon_adv(torch.optim.Optimizer):
 
         # MARS-M Approximated (Variance Reduction)
         if group.get('approx_mars', False):
-            grad = approx_mars(grad, state['last_grad'], group['mars_gamma'], beta1)
+            # If we are on the compiled path and stochastic rounding is enabled,
+            # generate a dedicated random tensor for the last_grad write so it does
+            # not reuse (and correlate with) the random stream used by set_state for
+            # the momentum buffers in the same step.
+            mars_random = random_int_state_tensor
+            if mars_random is None and self.stochastic_rounding and p.dtype == torch.bfloat16:
+                mars_random = param_update._get_random_int_for_sr(p)
+            grad = approx_mars(
+                grad, state['last_grad'], group['mars_gamma'], beta1,
+                stochastic_rounding=bool(self.stochastic_rounding),
+                random_int_tensor=mars_random,
+            )
 
         if grad.dtype != torch.float32 and state.get('factored', False):
             grad = grad.float()

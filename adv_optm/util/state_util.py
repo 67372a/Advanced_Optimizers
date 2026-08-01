@@ -39,7 +39,15 @@ def init_state_tensor(state: dict, key: str, shape: tuple, state_precision: str,
 
 def get_state(state: dict, key: str, state_precision: str) -> torch.Tensor:
     """
-    Retrieves and dequantizes the state tensor to float32.
+    Retrieves the state tensor for computation, always returning a float32
+    working tensor.
+    - 'int8_sr': dequantizes the blockwise-quantized state.
+    - 'bf16_sr': upcasts the stored bfloat16 state.
+    - 'auto'/'fp32': states are *stored* at the parameter dtype (memory savings),
+      but the returned working tensor is upcast to float32 so that all optimizer
+      arithmetic (momentum / second-moment accumulation, adaptive scaling) runs
+      in fp32. For fp32-stored states `.float()` is a no-op that returns the
+      same tensor (preserving in-place semantics).
     """
     tensor = state[key]
     if state_precision == 'int8_sr':
@@ -50,10 +58,8 @@ def get_state(state: dict, key: str, state_precision: str) -> torch.Tensor:
         result = blocks * scales.unsqueeze(1)
 
         return result.view(-1)[:orig_numel].view(orig_shape)
-    elif state_precision == 'bf16_sr':
+    else:  # 'auto', 'fp32', 'bf16_sr': always compute in float32.
         return tensor.float()
-    else: # 'auto', 'fp32'.
-        return tensor
 
 
 def _prepare_int8_blocks(
@@ -164,19 +170,17 @@ def set_state(state: dict, key: str, value: torch.Tensor, state_precision: str, 
 
 def upcast_grad_for_precision(grad: torch.Tensor, state: dict, state_precision: str) -> torch.Tensor:
     """
-    Upcasts the gradient to float32 if the optimizer state precision 
-    or factorization requires higher precision for accumulation.
+    Upcasts the gradient to float32 so that all optimizer accumulation runs in
+    fp32, regardless of the state storage precision.
     """
     # Factored states (SMMF) always require FP32 for reconstruction/factorization logic
     if state.get('factored', False):
         return grad.float()
 
-    # Low-precision storage modes benefit from FP32 accumulation to 
-    # maintain accuracy before quantizing back down in set_state.
-    if state_precision in ['fp32', 'bf16_sr', 'int8_sr', 'factored']:
-        return grad.float()
-
-    return grad
+    # 'auto' stores states at the parameter dtype (e.g. BF16) for memory savings,
+    # but computation must still happen in fp32. `.float()` on an already-fp32
+    # gradient is a no-op (returns the same tensor), so fp32 params are unaffected.
+    return grad.float()
 
 def fix_loaded_state_dtype(state: dict, p: torch.Tensor, group: dict) -> None:
     """
