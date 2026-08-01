@@ -330,19 +330,35 @@ def _is_suitable_for_muon(
 
     return True
 
-def approx_mars(current_grad: torch.Tensor, last_grad: torch.Tensor, mars_gamma:float, beta1:float):
+def approx_mars(current_grad: torch.Tensor, last_grad: torch.Tensor, mars_gamma:float, beta1:float, stochastic_rounding: bool = False, random_int_tensor: torch.Tensor | None = None):
     """
     The approximated version of MARS-M, proposed in the paper: "MARS-M: When Variance Reduction
     Meets Matrices" (https://arxiv.org/abs/2510.21800). A variance reduction technique that
     incorporates the changes in gradients into the momentum gradient.
-    Formula: c_t = g_t + gamma * beta / (1 - beta) * (g_t - g_{t-1}
+    Formula: c_t = g_t + gamma * beta / (1 - beta) * (g_t - g_{t-1})
+
+    `last_grad` is stored at the parameter's dtype. When that dtype is BF16 and
+    `stochastic_rounding` is enabled, the persisted value is written with unbiased
+    stochastic rounding (optionally using a pre-generated random tensor on the
+    compiled path) instead of a truncating cast.
     """
     mars_factor = mars_gamma * beta1 / (1.0 - beta1)
     # Compute corrected gradient c_t
     # c_t = current_grad + mars_factor * (current_grad - last_grad)
-    correction = current_grad.sub(last_grad).mul_(mars_factor).add_(current_grad)
-    # Update last_grad to current grad for the next step
-    last_grad.copy_(current_grad)
+    # last_grad is persisted in the parameter's dtype; cast it to the current
+    # gradient's dtype so the corrected gradient keeps the working dtype of the
+    # momentum accumulator (e.g. BF16 params would otherwise promote to fp32 and
+    # crash in `mt_buf.lerp_(grad, ...)`).
+    correction = current_grad.sub(last_grad.to(current_grad.dtype)).mul_(mars_factor).add_(current_grad)
+    # Update last_grad to current grad for the next step.
+    if last_grad.dtype == torch.bfloat16 and stochastic_rounding:
+        if random_int_tensor is not None:
+            # Compiled path: use the pre-generated random tensor.
+            param_update._copy_stochastic_core_(last_grad, current_grad.float(), random_int_tensor, inplace=False)
+        else:
+            param_update.copy_stochastic_(last_grad, current_grad.float())
+    else:
+        last_grad.copy_(current_grad)
     # Use correction as the gradient for subsequent momentum updates
     return correction
 

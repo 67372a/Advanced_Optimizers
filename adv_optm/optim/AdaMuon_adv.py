@@ -15,6 +15,65 @@ from ..util.state_util import init_state_tensor, get_state, set_state, upcast_gr
 
 A = 4 / math.pi
 
+
+def _muon_group_config(group: dict) -> tuple:
+    """Extracts the hyperparameters that are read as compile-time constants inside
+    the (optionally compiled) Muon step, so the torch.compile cache key is unique
+    per configuration. Without this, two groups sharing a shape but differing in
+    e.g. nesterov/use_atan2/state_precision would reuse a stale compiled graph."""
+    return (
+        group['lr'],
+        group['state_precision'],
+        group['betas'],
+        group['weight_decay'],
+        group.get('centered_wd', 0.0),
+        group.get('cautious_wd', False),
+        group.get('centered_wd_mode', 'float8'),
+        group['nesterov'],
+        group.get('nesterov_coef'),
+        group.get('kappa_p', 1.0),
+        group.get('auto_projection', True),
+        group['ns_eps'],
+        group['eps'],
+        group.get('approx_mars', False),
+        group.get('mars_gamma', 0.025),
+        group.get('orthogonal_gradient', 'disabled'),
+        group['ns_steps'],
+        group['ns_coeffs'],
+        group['accelerated_ns'],
+        group.get('cns_a_bound'),
+        group['low_rank_ortho'],
+        group['ortho_rank'],
+        group['normuon_variant'],
+        group['use_atan2'],
+        group['rms_rescaling'],
+        group.get('spectral_normalization', False),
+        group.get('vector_reshape', False),
+    )
+
+
+def _adam_group_config(group: dict) -> tuple:
+    """Extracts the hyperparameters that are read as compile-time constants inside
+    the (optionally compiled) AuxAdam step, so the torch.compile cache key is unique
+    per configuration."""
+    return (
+        group['lr'],
+        group.get('adam_state_precision', 'auto'),
+        group['adam_betas'],
+        group['adam_weight_decay'],
+        group.get('adam_use_bias_correction', True),
+        group.get('adam_fisher_wd', False),
+        group.get('adam_use_atan2', False),
+        group.get('adam_orthogonal_gradient', 'disabled'),
+        group.get('adam_nesterov', False),
+        group.get('adam_nesterov_coef'),
+        group.get('adam_spectral_normalization', False),
+        group.get('adam_kourkoutas_beta', False),
+        group.get('adam_nnmf_factor', False),
+        group.get('adam_factored_2nd', False),
+    )
+
+
 class AdaMuon_adv(torch.optim.Optimizer):
     """
     Implements an advanced AdaMuon optimizer algorithm.
@@ -388,7 +447,9 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
             # MARS-M state initialization
             if group.get('approx_mars', False):
-                # Note: This requires full-rank memory even if factored
+                # Note: This requires full-rank memory even if factored.
+                # Stored at the parameter's dtype; BF16 writes use stochastic rounding
+                # inside approx_mars to avoid biasing the variance-reduction signal.
                 state['last_grad'] = torch.zeros_like(p, device=device, dtype=p.dtype)
 
             _init_anchor(p, state, group)
@@ -422,19 +483,24 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
             beta1_adam, beta2_adam = group['adam_betas']
 
+            if group['adam_use_bias_correction']:
+                current_step = step + 1
+                bias_correction1 = 1.0 - beta1_adam ** current_step
+            else:
+                bias_correction1 = 1.0
+
             if self.kourkoutas_helper:
                 # Prepare Kourkoutas-β once per optimizer step.
                 self.kourkoutas_helper.maybe_prepare_step(step, p.device)
-                # Get the dynamic beta2_adam calculated in prepare_step()
+                # Get the dynamic beta2_adam calculated in prepare_step().
+                # This must be fetched AFTER the static defaults are unpacked
+                # (and after the bias-correction branch) so the dynamic value is
+                # never overwritten by the static `group['adam_betas']`.
                 beta2_adam = self.kourkoutas_helper.get_beta2(p, group)
 
             if group['adam_use_bias_correction']:
-                current_step = step + 1
-                beta1_adam, beta2_adam = group['adam_betas']
-                bias_correction1 = 1.0 - beta1_adam ** current_step
                 sqrt_bias_correction2 = (1.0 - beta2_adam ** current_step)**0.5
             else:
-                bias_correction1 = 1.0
                 sqrt_bias_correction2 = 1.0
 
             step_size = group['lr'] / bias_correction1
@@ -442,8 +508,8 @@ class AdaMuon_adv(torch.optim.Optimizer):
             random_int_state_tensor = None
             if is_compiled:
                 step_size = torch.as_tensor(step_size)
-                # Cache compiled function per-shape
-                cache_key = (p.shape, state.get('factored', False))
+                # Cache compiled function per-shape & hyperparameter configuration
+                cache_key = (p.shape, state.get('factored', False), state.get('factored_2nd', False), _adam_group_config(group))
                 if cache_key not in self._compiled_adam_step_fns:
                     self._compiled_adam_step_fns[cache_key] = torch.compile(
                         Muon_AuxAdam._adam_step_parameter,
@@ -470,8 +536,8 @@ class AdaMuon_adv(torch.optim.Optimizer):
             random_G_sketch = None
             if is_compiled:
                 lr = torch.as_tensor(group['lr'])
-                # Cache compiled function per-shape
-                cache_key = (p.shape, state.get('factored', False))
+                # Cache compiled function per-shape & hyperparameter configuration
+                cache_key = (p.shape, state.get('factored', False), state.get('factored_2nd', False), _muon_group_config(group))
                 if cache_key not in self._compiled_muon_step_fns:
                     self._compiled_muon_step_fns[cache_key] = torch.compile(
                         self._muon_step_parameter,
@@ -481,7 +547,8 @@ class AdaMuon_adv(torch.optim.Optimizer):
                 muon_step_param = self._compiled_muon_step_fns[cache_key]
 
                 # Generate state SR random tensor when compiled
-                actual_precision = group['actual_state_precision']
+                # (factored params never set group['actual_state_precision'], so use .get)
+                actual_precision = group.get('actual_state_precision', 'auto')
                 random_int_state_tensor = random_int_tensor
                 if actual_precision == 'bf16_sr' and random_int_state_tensor is None:
                     random_int_state_tensor = param_update._get_random_int_for_sr(p)
@@ -498,6 +565,8 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
     @torch.no_grad()
     def _muon_step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch):
+        original_shape = p.shape
+
         # Upcast grad for low-precision state modes (non-factored path)
         grad = upcast_grad_for_precision(grad, state, group.get('state_precision', 'auto'))
         beta1, beta2 = group['betas']
@@ -520,7 +589,18 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
         # MARS-M Approximated (Variance Reduction)
         if group.get('approx_mars', False):
-            grad = approx_mars(grad, state['last_grad'], group['mars_gamma'], beta1)
+            # If we are on the compiled path and stochastic rounding is enabled,
+            # generate a dedicated random tensor for the last_grad write so it does
+            # not reuse (and correlate with) the random stream used by set_state for
+            # the momentum buffers in the same step.
+            mars_random = random_int_state_tensor
+            if mars_random is None and self.stochastic_rounding and p.dtype == torch.bfloat16:
+                mars_random = param_update._get_random_int_for_sr(p)
+            grad = approx_mars(
+                grad, state['last_grad'], group['mars_gamma'], beta1,
+                stochastic_rounding=bool(self.stochastic_rounding),
+                random_int_tensor=mars_random,
+            )
 
 
         grad = _orthogonalize_gradient(p, grad, group.get("orthogonal_gradient"))
@@ -584,7 +664,6 @@ class AdaMuon_adv(torch.optim.Optimizer):
             update = update.reshape(p.shape)
 
         else: # Standard AdaMuon logic for non-factored tensors
-            original_shape = p.shape
             actual_precision = group['actual_state_precision']
             factored_2nd = state.get('factored_2nd', False)
 
@@ -603,66 +682,117 @@ class AdaMuon_adv(torch.optim.Optimizer):
             # Apply update projection
             update = _auto_projection_for_adamuon(update, kappa_p)
 
-            # Flatten if necessary (e.g., for Conv layers)
-            update = update.flatten(1)
+            # Muon orthogonalization requires a 2D matrix. 2D+ tensors are flattened
+            # along dim 1 first; 1D tensors (e.g. biases) have no matrix structure
+            # and are adaptively scaled element-wise instead.
+            if len(original_shape) >= 2:
+                # Flatten if necessary (e.g., for Conv layers)
+                update = update.flatten(1)
 
-            # Orthogonalization step
-            update = newton_schulz(
-                update,
-                steps=group['ns_steps'],
-                eps=ns_eps,
-                coeffs=group['ns_coeffs'],
-                cns=group['accelerated_ns'],
-                cns_a_bound=group['cns_a_bound'],
-                low_rank_ortho=group['low_rank_ortho'],
-                ortho_rank=group['ortho_rank'],
-                G_sketch=random_G_sketch,
-                compiled=group.get('compiled_optimizer', False)
-            )
+                # Orthogonalization step
+                update = newton_schulz(
+                    update,
+                    steps=group['ns_steps'],
+                    eps=ns_eps,
+                    coeffs=group['ns_coeffs'],
+                    cns=group['accelerated_ns'],
+                    cns_a_bound=group['cns_a_bound'],
+                    low_rank_ortho=group['low_rank_ortho'],
+                    ortho_rank=group['ortho_rank'],
+                    G_sketch=random_G_sketch,
+                    compiled=group.get('compiled_optimizer', False)
+                )
 
-            # NorMuon Logic
-            if group['normuon_variant']:
-                normuon_update(update, state['normuon_v'], beta2, group['eps'])
-            elif factored_2nd:
-                # Factorized second moment: reconstruct → update → re-factorize
-                d1, d2 = state['effective_shape']
-                update = update.view(original_shape)
-                update_f32 = update.float()
-                vt_buf = _reconstruct_state((state['mu_vbuf_nmf'], state['mv_vbuf_nmf']), signed=False, shifter=state['shifter'])
-                vt_buf.mul_(beta2).addcmul_(update_f32.view(d1, d2), update_f32.view(d1, d2), value=1 - beta2)
-                for key, val in zip(('mu_vbuf_nmf', 'mv_vbuf_nmf'), _factorize_state(vt_buf, signed=False, shifter=state['shifter'])):
-                    state[key].copy_(val)
-                # Apply second moment scaling
-                if group['use_atan2']:
-                    denom = vt_buf.sqrt_().view(original_shape)
-                    update.atan2_(denom.to(update.dtype))
+                # NorMuon Logic
+                if group['normuon_variant']:
+                    normuon_update(update, state['normuon_v'], beta2, group['eps'])
+                elif factored_2nd:
+                    # Factorized second moment: reconstruct → update → re-factorize
+                    d1, d2 = state['effective_shape']
+                    update = update.view(original_shape)
+                    update_f32 = update.float()
+                    vt_buf = _reconstruct_state((state['mu_vbuf_nmf'], state['mv_vbuf_nmf']), signed=False, shifter=state['shifter'])
+                    vt_buf.mul_(beta2).addcmul_(update_f32.view(d1, d2), update_f32.view(d1, d2), value=1 - beta2)
+                    for key, val in zip(('mu_vbuf_nmf', 'mv_vbuf_nmf'), _factorize_state(vt_buf, signed=False, shifter=state['shifter'])):
+                        state[key].copy_(val)
+                    # Apply second moment scaling
+                    if group['use_atan2']:
+                        denom = vt_buf.sqrt_().view(original_shape)
+                        update.atan2_(denom.to(update.dtype))
+                    else:
+                        denom = vt_buf.sqrt_().add_(adaptive_eps).view(original_shape)
+                        update.div_(denom.to(update.dtype))
+                    del denom, vt_buf, update_f32
                 else:
-                    denom = vt_buf.sqrt_().add_(adaptive_eps).view(original_shape)
-                    update.div_(denom.to(update.dtype))
-                del denom, vt_buf, update_f32
+                    # Original AdaMuon Logic
+                    update = update.view(original_shape)
+                    vt_buf = get_state(state, 'second_momentum_buffer', actual_precision)
+                    vt_buf.mul_(beta2).addcmul_(update, update, value=1 - beta2)
+                    # Apply second momentum update (adaptive scaling)
+                    if group['use_atan2']:
+                        denom = vt_buf.sqrt()
+                        update.atan2_(denom)
+                    else:
+                        denom = vt_buf.sqrt().add_(adaptive_eps)
+                        update.div_(denom)
+                    set_state(state, 'second_momentum_buffer', vt_buf, actual_precision, random_int_state_tensor, non_neg=True)
+                    del denom
+
+                update = update.view(original_shape)
             else:
-                # Original AdaMuon Logic
-                update = update.view(original_shape)
-                vt_buf = get_state(state, 'second_momentum_buffer', actual_precision)
-                vt_buf.mul_(beta2).addcmul_(update, update, value=1 - beta2)
-                # Apply second momentum update (adaptive scaling)
-                if group['use_atan2']:
-                    denom = vt_buf.sqrt()
-                    update.atan2_(denom)
+                # 1D tensors: no matrix structure to orthogonalize, so apply
+                # element-wise adaptive scaling using the second momentum.
+                if group['normuon_variant']:
+                    # NorMuon row-wise normalization is undefined for 1D tensors
+                    # (normuon_v is not allocated for 1D in __init_state); normalize
+                    # by the global RMS as a graceful degradation.
+                    update.div_(update.square().mean().sqrt_().add_(adaptive_eps))
+                elif factored_2nd:
+                    # Factorized second moment: reconstruct → update → re-factorize
+                    d1, d2 = state['effective_shape']
+                    update_f32 = update.float()
+                    vt_buf = _reconstruct_state((state['mu_vbuf_nmf'], state['mv_vbuf_nmf']), signed=False, shifter=state['shifter'])
+                    vt_buf.mul_(beta2).addcmul_(update_f32.view(d1, d2), update_f32.view(d1, d2), value=1 - beta2)
+                    for key, val in zip(('mu_vbuf_nmf', 'mv_vbuf_nmf'), _factorize_state(vt_buf, signed=False, shifter=state['shifter'])):
+                        state[key].copy_(val)
+                    # Apply second moment scaling
+                    if group['use_atan2']:
+                        denom = vt_buf.sqrt_().view(original_shape)
+                        update.atan2_(denom.to(update.dtype))
+                    else:
+                        denom = vt_buf.sqrt_().add_(adaptive_eps).view(original_shape)
+                        update.div_(denom.to(update.dtype))
+                    del denom, vt_buf, update_f32
                 else:
-                    denom = vt_buf.sqrt().add_(adaptive_eps)
-                    update.div_(denom)
-                set_state(state, 'second_momentum_buffer', vt_buf, actual_precision, random_int_state_tensor, non_neg=True)
-                del denom
+                    vt_buf = get_state(state, 'second_momentum_buffer', actual_precision)
+                    vt_buf.mul_(beta2).addcmul_(update, update, value=1 - beta2)
+                    # Apply second momentum update (adaptive scaling)
+                    if group['use_atan2']:
+                        denom = vt_buf.sqrt()
+                        update.atan2_(denom)
+                    else:
+                        denom = vt_buf.sqrt().add_(adaptive_eps)
+                        update.div_(denom)
+                    set_state(state, 'second_momentum_buffer', vt_buf, actual_precision, random_int_state_tensor, non_neg=True)
+                    del denom
 
         step_scale = lr * A if group['use_atan2'] and not group['normuon_variant'] else lr
 
         if group.get('spectral_normalization', False):
             # Spectral Normalization
             scale_update(p, update, lr, state)
-        else:
-            # RMS-aligned rescaling
+        elif len(original_shape) >= 2:
+            # RMS-aligned rescaling (requires a 2D matrix for the aspect-ratio
+            # fallback used when rms_rescaling is disabled)
             rms_adjustment(update, group['rms_rescaling'], step_scale)
+        else:
+            # 1D parameters have no matrix structure, so the Muon aspect-ratio
+            # scaling (r/c) is undefined. Use RMS-aligned rescaling when enabled,
+            # otherwise scale by the plain step size.
+            if group['rms_rescaling']:
+                rms_adjustment(update, True, step_scale)
+            else:
+                update.mul_(step_scale)
 
         update = update.reshape(original_shape)
 
