@@ -20,6 +20,17 @@ Covers the defects found during code review of `adv_optm/optim/SinkSGD_adv.py`:
 - Defect 7: in-place sign/sinkhorn ops mutated the user's fp32 p.grad buffer.
 - Defect 9: is_vector was defined inconsistently between state initialization
   and the step function.
+- Defect 10: the compiled path drew ONE stochastic-rounding noise tensor and
+  reused it for BOTH the momentum-state SR and the parameter SR (aliased via
+  `random_int_state_tensor = random_int_tensor`), while the uncompiled path
+  drew two independent tensors (state first, then parameter).  This broke the
+  deterministic RNG stream parity between the two paths and correlated the two
+  rounding operations. Fixed by drawing state SR before parameter SR and always
+  using independent tensors.
+- Defect 11: is_vector treated 0-dim (scalar) parameters inconsistently
+  (`len(p.shape) == 1` in __init_state vs `grad.ndim < 2` in _step_parameter),
+  so a scalar parameter with vector_reshape=True crashed with IndexError inside
+  apply_sr_sinkhorn. Scalars are now always treated as vectors.
 
 All tests run on CUDA as mandated by the project conventions.
 """
@@ -34,6 +45,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from adv_optm.optim.SinkSGD_adv import SinkSGD_adv  # noqa: E402
+from adv_optm.util import param_update  # noqa: E402
 
 DEVICE = torch.device("cuda:0")
 torch.manual_seed(0)
@@ -361,6 +373,89 @@ class TestCompiledPath(unittest.TestCase):
         opt = SinkSGD_adv([p], **base_kwargs(compiled_optimizer=True, state_precision="bf16_sr"))
         opt.step()
         self.assertEqual(opt.state[p]["step"], 1)
+
+
+class TestCompiledRngStreamParity(unittest.TestCase):
+    """Defect 10: compiled and uncompiled paths must consume the deterministic
+    SR generator in the same order (state first, parameter second) and with the
+    same number of independent draws, producing identical parameter updates."""
+
+    def _run_and_log_draws(self, compiled: bool, state_precision: str, dtype):
+        draw_log = []
+        orig_draw = param_update._get_random_int_for_sr
+        orig_draw8 = param_update._get_random_int_for_8bit_sr
+
+        def spy_sr(source):
+            t = orig_draw(source)
+            draw_log.append(("sr", tuple(source.shape), int(t.flatten()[0].item())))
+            return t
+
+        def spy_8bit(source, numel=None):
+            t = orig_draw8(source, numel)
+            draw_log.append(("8bit", tuple(t.shape), int(t.flatten()[0].item())))
+            return t
+
+        param_update._get_random_int_for_sr = spy_sr
+        param_update._get_random_int_for_8bit_sr = spy_8bit
+        try:
+            torch.manual_seed(1234)
+            param_update.set_seed(DEVICE)
+            p = make_param((16, 16), dtype=dtype)
+            opt = SinkSGD_adv(
+                [p],
+                lr=1e-3,
+                momentum=0.9,
+                state_precision=state_precision,
+                compiled_optimizer=compiled,
+            )
+            opt.step()
+        finally:
+            param_update._get_random_int_for_sr = orig_draw
+            param_update._get_random_int_for_8bit_sr = orig_draw8
+        return p.detach().clone(), draw_log
+
+    def test_bf16_param_bf16_sr_state(self):
+        # Two independent draws (state first, then parameter), identical in both
+        # paths, and bitwise-identical parameter updates.
+        p_comp, draws_comp = self._run_and_log_draws(True, "bf16_sr", torch.bfloat16)
+        p_uncomp, draws_uncomp = self._run_and_log_draws(False, "bf16_sr", torch.bfloat16)
+        self.assertEqual(len(draws_comp), 2)
+        self.assertEqual(draws_comp, draws_uncomp)
+        self.assertTrue(torch.equal(p_comp, p_uncomp))
+
+    def test_bf16_param_int8_sr_state(self):
+        p_comp, draws_comp = self._run_and_log_draws(True, "int8_sr", torch.bfloat16)
+        p_uncomp, draws_uncomp = self._run_and_log_draws(False, "int8_sr", torch.bfloat16)
+        self.assertEqual(len(draws_comp), 2)
+        self.assertEqual(draws_comp, draws_uncomp)
+        self.assertTrue(torch.equal(p_comp, p_uncomp))
+
+    def test_fp32_param_bf16_sr_state(self):
+        # Only the state needs SR noise here; both paths draw exactly once.
+        p_comp, draws_comp = self._run_and_log_draws(True, "bf16_sr", torch.float32)
+        p_uncomp, draws_uncomp = self._run_and_log_draws(False, "bf16_sr", torch.float32)
+        self.assertEqual(len(draws_comp), 1)
+        self.assertEqual(draws_comp, draws_uncomp)
+
+
+class TestScalarParams(unittest.TestCase):
+    """Defect 11: 0-dim (scalar) parameters must be handled consistently."""
+
+    def test_scalar_vector_reshape_runs(self):
+        p = torch.nn.Parameter(torch.tensor(0.1, device=DEVICE))
+        p.grad = torch.tensor(0.05, device=DEVICE)
+        opt = SinkSGD_adv([p], lr=1e-3, momentum=0.9, vector_reshape=True,
+                          state_precision="factored")
+        opt.step()
+        self.assertEqual(opt.state[p]["step"], 1)
+
+    def test_scalar_default_runs(self):
+        p = torch.nn.Parameter(torch.tensor(0.1, device=DEVICE))
+        p.grad = torch.tensor(0.05, device=DEVICE)
+        opt = SinkSGD_adv([p], lr=1e-3, momentum=0.9)
+        opt.step()
+        opt.step()
+        self.assertEqual(opt.state[p]["step"], 2)
 
 
 class TestStateDict(unittest.TestCase):

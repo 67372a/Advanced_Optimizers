@@ -189,9 +189,11 @@ class SinkSGD_adv(torch.optim.Optimizer):
             req_precision = group['state_precision']
             # Keep the is_vector definition identical to the one used at step time
             # (see _step_parameter) so state allocation matches the runtime branches.
+            # Note: 0-dim (scalar) tensors are ALWAYS treated as vectors since a
+            # meaningful 2D reshape / Sinkhorn normalization does not exist for them.
             is_vector = (
-                len(p.shape) == 1 and not group['vector_reshape']
-            ) or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
+                len(p.shape) < 2 and not group['vector_reshape']
+            ) or len(p.shape) == 0 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
 
             state['factored'] = req_precision == 'factored' and not is_vector
 
@@ -243,18 +245,23 @@ class SinkSGD_adv(torch.optim.Optimizer):
 
         if group.get('compiled_optimizer', False):
             step_size = torch.as_tensor(step_size)
-            if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                random_int_tensor = param_update._get_random_int_for_sr(p)
-                random_int_state_tensor = random_int_tensor
             # Only momentum states need stochastic-rounded storage; gate the RNG
-            # draw on the exact conditions that consume it so the compiled and
+            # draws on the exact conditions that consume them so the compiled and
             # uncompiled paths keep identical (deterministic) RNG streams.
+            # Draw the state SR tensor FIRST and the parameter SR tensor SECOND,
+            # mirroring the uncompiled path where set_state() draws before
+            # apply_parameter_update(). The state and parameter must also use
+            # INDEPENDENT noise tensors (the uncompiled path draws them
+            # separately); reusing one tensor for both would both corrupt the
+            # stream parity and correlate the two rounding operations.
             has_state = group.get('momentum', 0) > 0 and not state.get('factored', False)
             if has_state:
-                if group['actual_state_precision'] == 'bf16_sr' and random_int_state_tensor is None:
+                if group['actual_state_precision'] == 'bf16_sr':
                     random_int_state_tensor = param_update._get_random_int_for_sr(p)
                 elif group['actual_state_precision'] == 'int8_sr':
                     random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
+            if p.dtype == torch.bfloat16 and self.stochastic_rounding:
+                random_int_tensor = param_update._get_random_int_for_sr(p)
             # Cache compiled function per-shape/dtype/device
             cache_key = (p.shape, p.dtype, p.device, state.get('factored', False))
             if cache_key not in self._compiled_step_fns:
@@ -276,10 +283,11 @@ class SinkSGD_adv(torch.optim.Optimizer):
         # NOTE: fp32 gradients were already cloned in step_parameter, so the
         # in-place normalization/sign operations below never touch the user's p.grad.
         # Keep the is_vector definition identical to the one used in __init_state
-        # so state allocation matches the runtime branches.
+        # so state allocation matches the runtime branches. 0-dim (scalar)
+        # tensors are always treated as vectors (see __init_state).
         is_vector = (
             grad.ndim < 2 and not group.get('vector_reshape', False)
-        ) or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
+        ) or grad.ndim == 0 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
         sinkhorn_iterations = group['sinkhorn_iterations']
         orthogonal_sinkhorn = group['orthogonal_sinkhorn']
 
