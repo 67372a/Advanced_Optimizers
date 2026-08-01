@@ -467,6 +467,11 @@ class AdaMuon_adv(torch.optim.Optimizer):
         if grad is None:
             return
 
+        # Defensive copy: the step function applies in-place normalization/sign to
+        # the gradient. For fp32 grads upcast_grad_for_precision returns the same
+        # buffer, so clone here to avoid ever mutating the user's p.grad.
+        if grad.dtype == torch.float32:
+            grad = grad.clone()
         state = self.state[p]
 
         self.__init_state(p, group)

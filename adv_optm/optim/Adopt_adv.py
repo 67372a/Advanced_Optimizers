@@ -293,6 +293,11 @@ class Adopt_adv(torch.optim.Optimizer):
             return
 
         grad = p.grad
+        # Defensive copy: the step function applies in-place normalization to the
+        # gradient. For fp32 grads upcast_grad_for_precision returns the same
+        # buffer, so clone here to avoid ever mutating the user's p.grad.
+        if grad.dtype == torch.float32:
+            grad = grad.clone()
         state = self.state[p]
         self.__init_state(p, group)
 
@@ -314,7 +319,10 @@ class Adopt_adv(torch.optim.Optimizer):
         # The first step is for initialization only (skip when use_atan2 as it's scale invariant).
         if state['step'] == 0 and not (self.use_atan2 or group.get('spectral_normalization', False)):
             state['step'] += 1
-            self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
+            # The helper only exists when kourkoutas_beta is enabled; without it
+            # the accumulator is unused and would raise AttributeError.
+            if group.get('kourkoutas_beta', False):
+                self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
             return
 
         random_int_tensor = None
