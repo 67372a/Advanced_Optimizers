@@ -13,38 +13,62 @@ from ..util.signed_util import get_signsgd_wd_target
 
 class SinkSGD_adv(torch.optim.Optimizer):
     """
-    Implements an advanced Stochastic Gradient Descent (SGD) with Sinkhorn Iterative Normalization (SinkSGD) algorithm.
-    This is an advanced version of SinkSGD with optional features like
-    low-rank factorization of optimizer states (SMMF), OrthoGrad, etc.
+    Implements an advanced Stochastic Gradient Descent (SGD) with Sinkhorn Iterative
+    Normalization (SinkSGD). The gradient/update matrix is driven toward a fixed
+    point where every row and column has uniform L2 magnitude (multi-normalization).
+    This advanced version adds optional low-rank factorization of optimizer states
+    (SMMF, state_precision='factored'), OrthoGrad, Nesterov momentum, SNR
+    preconditioning, centered/cautious/geometric weight decay, spectral
+    normalization, and torch.compile support.
 
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float): learning rate (default: 1e-3)
-        momentum (float): momentum factor (default: 0)
-        weight_decay (float): weight decay (L2 penalty or decoupled) (default: 0).
+            parameter groups.
+        lr (float): learning rate (default: 1e-3).
+        momentum (float): momentum factor in [0.0, 1.0] (default: 0.0).
+        weight_decay (float): weight decay (L2 penalty or decoupled) (default: 0.0).
+        sinkhorn_iterations (int): number of alternating row/column L2
+            normalization iterations applied by SR-Sinkhorn (default: 5).
+        orthogonal_sinkhorn (bool): projects the update orthogonal to the
+            parameter during each Sinkhorn normalization step (default: False).
+        normed_momentum (bool): normalize the gradient *before* it enters the
+            momentum buffer ("Normalization then Momentum") instead of after
+            (default: False).
+        snr_cond (bool): SNR preconditioning. Scales the update by the empirical
+            signal-to-noise ratio of the momentum buffer before applying the
+            atan bounding. Requires normed_momentum and momentum > 0
+            (default: False).
         nesterov (bool): enables Nesterov momentum. Only applicable when momentum
-            is non-zero. (default: False)
-        cautious_wd (bool): Enables Cautious Weight Decay. If True, weight decay is
-            applied only to parameter coordinates where the sign of the parameter
-            and the sign of the optimizer update align (default: False).
-        vector_reshape (bool): whether to reshape 1D vectors into 2D
-            matrices to apply low-rank compression (default: True).
-        stochastic_rounding (bool): whether to use stochastic
-            rounding for BF16 parameter updates (default: True).
-        orthogonal_gradient (bool): whether to use OrthoGrad. (default: False)
-        centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
-            toward zero, they are decayed toward their initial values (anchors). This
-            can be used together with standard weight decay. (default: 0.0)
-        centered_wd_mode (str): The quantization format used to store the anchor
-            weights to save VRAM. Options include:
-            'full', 'float8', 'int8', 'int4'. (default: 'float8')
-        nnmf_factor (bool): whether to use factorization or disable it. (default: False)
-        state_precision (str): Precision method for states. Options: 'auto'
-            (parameter precision), 'fp32', 'factored' (SMMF low-rank FP32), 'bf16_sr',
-            'int8_sr'. (default: 'auto')
-        compiled_optimizer (bool): Compiles the core step function using torch.compile
-            for faster execution. (default: False)
+            is non-zero (default: False).
+        nesterov_coef (float | None): Nesterov lookahead coefficient. Defaults to
+            the momentum value when None (default: None).
+        geometric_wd (bool): uses a structural weight-decay scaler that penalizes
+            dominant rows/columns more heavily (default: False).
+        cautious_wd (bool): weight decay is applied only to coordinates where the
+            sign of the parameter and the sign of the optimizer update align
+            (default: False).
+        stochastic_rounding (bool): stochastic rounding for BF16 parameter updates
+            (default: True).
+        orthogonal_gradient (str): OrthoGrad mode. One of 'disabled', 'flattened'
+            (vectorized projection), or 'iterative' (alternating row/column
+            projection) (default: 'disabled').
+        spectral_normalization (bool): scales the update so the parameter's
+            spectral norm is preserved (default: False).
+        centered_wd (float): Centered Weight Decay coefficient. Weights decay
+            toward their initial values (anchors) instead of zero. Can be combined
+            with standard weight decay (default: 0.0).
+        centered_wd_mode (str): quantization format for anchor weights to save
+            VRAM. One of 'full', 'float8', 'int8', 'int4' (default: 'float8').
+        state_precision (str): precision for optimizer states. One of 'auto'
+            (parameter precision), 'fp32', 'factored' (SMMF low-rank FP32),
+            'bf16_sr' (BF16 with stochastic rounding), 'fp16', 'int8_sr'
+            (blockwise INT8 with stochastic rounding) (default: 'auto').
+        nnmf_factor (bool): legacy alias; forces state_precision='factored' when
+            True (default: False).
+        vector_reshape (bool): treat 1D vectors as 2D matrices so low-rank
+            factorization / Sinkhorn normalization can be applied (default: False).
+        compiled_optimizer (bool): compile the core step function with torch.compile
+            for faster execution (default: False).
     """
 
     def __init__(
@@ -85,12 +109,18 @@ class SinkSGD_adv(torch.optim.Optimizer):
     ):
         if not (lr >= 0.0):
             raise ValueError(f"Learning-rate should be >= 0.0. Got {lr}")
-        if not (momentum >= 0.0):
-            raise ValueError(f"Momentum should be >= 0.0. Got {momentum}")
+        if not (0.0 <= momentum <= 1.0):
+            raise ValueError(f"Momentum should be in [0.0, 1.0]. Got {momentum}")
         if not (weight_decay >= 0.0):
             raise ValueError(f"Weight-decay should be >= 0.0. Got {weight_decay}")
-        if snr_cond and not normed_momentum and not momentum > 0:
-            raise NotImplementedError(f"snr_cond is intended to be used with normed_momentum.")
+        if nesterov_coef is not None and not (0.0 <= nesterov_coef <= 1.0):
+            raise ValueError(f"nesterov_coef should be in [0.0, 1.0] or None. Got {nesterov_coef}")
+        if sinkhorn_iterations < 0:
+            raise ValueError(f"sinkhorn_iterations should be >= 0. Got {sinkhorn_iterations}")
+        if orthogonal_gradient not in ('disabled', 'flattened', 'iterative'):
+            raise ValueError(f"orthogonal_gradient must be one of 'disabled', 'flattened', 'iterative'. Got {orthogonal_gradient}")
+        if snr_cond and (not normed_momentum or momentum <= 0.0):
+            raise NotImplementedError("snr_cond is intended to be used with normed_momentum and momentum > 0.")
 
         state_precision = state_precision.lower()
         valid_precisions = {"auto", "fp32", "factored", "bf16_sr", "fp16", "int8_sr"}
@@ -157,7 +187,11 @@ class SinkSGD_adv(torch.optim.Optimizer):
             state['step'] = 0
 
             req_precision = group['state_precision']
-            is_vector = len(p.shape) == 1 and not group['vector_reshape']
+            # Keep the is_vector definition identical to the one used at step time
+            # (see _step_parameter) so state allocation matches the runtime branches.
+            is_vector = (
+                len(p.shape) == 1 and not group['vector_reshape']
+            ) or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
 
             state['factored'] = req_precision == 'factored' and not is_vector
 
@@ -167,9 +201,12 @@ class SinkSGD_adv(torch.optim.Optimizer):
             dtype = torch.float32 if (state['factored'] or req_precision == 'factored') else p.dtype
             device = p.device
 
-            if group['momentum'] != 0:
-                if state['factored']:
-                    state['effective_shape'] = _get_effective_shape(p.numel())
+            if state['factored']:
+                # effective_shape is needed even when momentum == 0 because the
+                # factored step path reshapes the gradient with it before cloning.
+                state['effective_shape'] = _get_effective_shape(p.numel())
+
+                if group['momentum'] != 0:
                     d1, d2 = state['effective_shape']
 
                     state['mu_b_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
@@ -177,9 +214,8 @@ class SinkSGD_adv(torch.optim.Optimizer):
                     packed_d2 = (d2 + 7) // 8
                     state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=device)
                     state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
-                else: 
-                    if group['momentum'] != 0:
-                        init_state_tensor(state, 'momentum_buffer', p.shape, actual_precision, p.device, dtype)
+            elif group['momentum'] != 0:
+                init_state_tensor(state, 'momentum_buffer', p.shape, actual_precision, p.device, dtype)
 
             if group.get('spectral_normalization', False) and is_spectral(p):
                 init_spectral_norm(state, p)
@@ -192,6 +228,11 @@ class SinkSGD_adv(torch.optim.Optimizer):
             return
 
         grad = p.grad
+        # Defensive copy: the step function applies in-place normalization/sign to
+        # the gradient. For fp32 grads upcast_grad_for_precision returns the same
+        # buffer, so clone here to avoid ever mutating the user's p.grad.
+        if grad.dtype == torch.float32:
+            grad = grad.clone()
         state = self.state[p]
         self.__init_state(p, group)
 
@@ -205,12 +246,17 @@ class SinkSGD_adv(torch.optim.Optimizer):
             if p.dtype == torch.bfloat16 and self.stochastic_rounding:
                 random_int_tensor = param_update._get_random_int_for_sr(p)
                 random_int_state_tensor = random_int_tensor
-            if group['actual_state_precision'] == 'bf16_sr' and random_int_state_tensor is None:
-                random_int_state_tensor = param_update._get_random_int_for_sr(p)
-            elif group['actual_state_precision'] == 'int8_sr':
-                random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
-            # Cache compiled function per-shape
-            cache_key = (p.shape, state.get('factored', False))
+            # Only momentum states need stochastic-rounded storage; gate the RNG
+            # draw on the exact conditions that consume it so the compiled and
+            # uncompiled paths keep identical (deterministic) RNG streams.
+            has_state = group.get('momentum', 0) > 0 and not state.get('factored', False)
+            if has_state:
+                if group['actual_state_precision'] == 'bf16_sr' and random_int_state_tensor is None:
+                    random_int_state_tensor = param_update._get_random_int_for_sr(p)
+                elif group['actual_state_precision'] == 'int8_sr':
+                    random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
+            # Cache compiled function per-shape/dtype/device
+            cache_key = (p.shape, p.dtype, p.device, state.get('factored', False))
             if cache_key not in self._compiled_step_fns:
                 self._compiled_step_fns[cache_key] = torch.compile(
                     self._step_parameter,
@@ -227,7 +273,13 @@ class SinkSGD_adv(torch.optim.Optimizer):
 
     def _step_parameter(self, p, grad, state, group, step_size, random_int_tensor, random_int_state_tensor):
         grad = upcast_grad_for_precision(grad, state, group['state_precision'])
-        is_vector = grad.ndim < 2 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
+        # NOTE: fp32 gradients were already cloned in step_parameter, so the
+        # in-place normalization/sign operations below never touch the user's p.grad.
+        # Keep the is_vector definition identical to the one used in __init_state
+        # so state allocation matches the runtime branches.
+        is_vector = (
+            grad.ndim < 2 and not group.get('vector_reshape', False)
+        ) or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
         sinkhorn_iterations = group['sinkhorn_iterations']
         orthogonal_sinkhorn = group['orthogonal_sinkhorn']
 
@@ -235,7 +287,9 @@ class SinkSGD_adv(torch.optim.Optimizer):
         normed_mt = group.get('normed_momentum', False)
         nesterov = group['nesterov']
         nesterov_coef = group.get('nesterov_coef', None)
-        snr_cond = group.get('snr_cond', False)
+        # snr_cond requires normalized momentum; the momentum > 0 guard guarantees
+        # vt_row/vt_col/denom are always populated when snr_cond is active.
+        snr_cond = group.get('snr_cond', False) and normed_mt and momentum > 0
 
         vt_row = None
         vt_col = None
@@ -361,11 +415,12 @@ class SinkSGD_adv(torch.optim.Optimizer):
                 del anchor
 
         update_scaling = step_size
+        if snr_cond:
+            # Compensate for the bounded atan/atan2 preconditioning in both paths.
+            update_scaling = update_scaling * (4/math.pi)
         if group.get('spectral_normalization', False):
             update = scale_update(p, update, update_scaling, state=state)
         else:
-            if snr_cond:
-                update_scaling = update_scaling * (4/math.pi)
             update.mul_(update_scaling)
 
         param_update.apply_parameter_update(self, p, group, update, step_size, random_int_tensor=random_int_tensor, wd_scaler=wd_scaler, wd_target=wd_target, cwd_target=cwd_target)
