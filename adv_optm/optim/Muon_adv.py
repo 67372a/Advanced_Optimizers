@@ -376,6 +376,22 @@ class Muon_adv(torch.optim.Optimizer):
             # Pre-generate random tensor for stochastic rounding if needed.
             random_int_tensor = param_update._get_random_int_for_sr(p)
 
+        # torch._dynamo refuses to trace a graph input tensor whose .grad dtype
+        # differs from its own dtype (FSDP-related fake-tensor check in
+        # torch/_dynamo/variables/builder.py). The compiled step functions only
+        # consume the `grad` argument, never p.grad, so on the compiled path with
+        # a dtype mismatch pass a storage-sharing detached view (no .grad
+        # attribute). apply_parameter_update receives `state` explicitly, so no
+        # self.state[p] lookup (which would re-trigger the check by wrapping the
+        # mismatched key) happens inside the compiled graph.
+        step_p = p
+        if is_compiled and grad.dtype != p.dtype:
+            step_p = p.detach()
+            # Preserve custom layer markers consumed by adjust_wds / is_spectral.
+            for _a in ('_is_dora_scale', '_is_oft', '_is_lora_A', '_is_lora_B', 'is_vector', 'is_hidden'):
+                if hasattr(p, _a):
+                    setattr(step_p, _a, getattr(p, _a))
+
         if not state['is_muon']: # AdamW path
             step = state['step']
 
@@ -420,7 +436,7 @@ class Muon_adv(torch.optim.Optimizer):
             else:
                 adam_step_param = Muon_AuxAdam._adam_step_parameter
 
-            adam_step_param(self, p, grad, state, group, beta1_adam, beta2_adam, sqrt_bias_correction2, step_size, random_int_tensor, random_int_state_tensor)
+            adam_step_param(self, step_p, grad, state, group, beta1_adam, beta2_adam, sqrt_bias_correction2, step_size, random_int_tensor, random_int_state_tensor)
 
             state['step'] += 1
 
@@ -452,7 +468,7 @@ class Muon_adv(torch.optim.Optimizer):
                 random_int_state_tensor = None
                 muon_step_param = self._muon_step_parameter
 
-            muon_step_param(p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch)
+            muon_step_param(step_p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch)
 
     @torch.no_grad()
     def _muon_step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch):
@@ -578,7 +594,7 @@ class Muon_adv(torch.optim.Optimizer):
 
             update = update.reshape(original_shape)
 
-        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor)
+        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor, state=state)
 
     @torch.no_grad()
     def step(self, closure=None):

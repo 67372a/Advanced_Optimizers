@@ -86,6 +86,7 @@ def apply_parameter_update(
     wd_scaler: float | Tensor | None = None,
     wd_target: Tensor | None = None,
     cwd_target: Tensor | None = None,
+    state: Dict[str, Any] | None = None,
 ) -> None:
     """
     Applies decoupled weight decay (standard, cautious, centered) and the final
@@ -118,7 +119,8 @@ def apply_parameter_update(
         if scaled_cwd is not None:
             scaled_cwd = scaled_cwd * wd_scaler
 
-    state = self.state[p]
+    if state is None:
+        state = self.state[p]
 
     # Compute full update in float32 if using bfloat16 with stochastic rounding
     if p.dtype == torch.bfloat16 and self.stochastic_rounding:
