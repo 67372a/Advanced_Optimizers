@@ -55,7 +55,8 @@ def _muon_group_config(group: dict) -> tuple:
 def _adam_group_config(group: dict) -> tuple:
     """Extracts the hyperparameters that are read as compile-time constants inside
     the (optionally compiled) AuxAdam step, so the torch.compile cache key is unique
-    per configuration."""
+    per configuration. Without this, two groups sharing a shape but differing in
+    e.g. adam_eps / centered_wd / cautious_wd would reuse a stale compiled graph."""
     return (
         group['lr'],
         group.get('adam_state_precision', 'auto'),
@@ -71,6 +72,12 @@ def _adam_group_config(group: dict) -> tuple:
         group.get('adam_kourkoutas_beta', False),
         group.get('adam_nnmf_factor', False),
         group.get('adam_factored_2nd', False),
+        # Values read inside the compiled step via scale_eps(group['adam_eps'], p)
+        # and apply_parameter_update -> _apply_weight_decay / dequantize_anchor.
+        group.get('adam_eps', 1e-8),
+        group.get('centered_wd', 0.0),
+        group.get('cautious_wd', False),
+        group.get('centered_wd_mode', 'float8'),
     )
 
 
@@ -430,7 +437,7 @@ class AdaMuon_adv(torch.optim.Optimizer):
                     state['mu_vbuf_nmf'] = torch.zeros(d1, device=device, dtype=dtype)
                     state['mv_vbuf_nmf'] = torch.zeros(d2, device=device, dtype=dtype)
             else:
-                # Determine effective state precision (small tensors always use fp32)
+                # Determine effective state precision
                 req_precision = group.get('state_precision', 'auto')
                 actual_precision = 'auto' if req_precision == 'factored' else req_precision
                 group['actual_state_precision'] = actual_precision
@@ -496,7 +503,11 @@ class AdaMuon_adv(torch.optim.Optimizer):
             grad = grad.clone()
         state = self.state[p]
 
-        self.__init_state(p, group)
+        # Lazily initialize state on first contact (fresh param or one added via
+        # add_param_group). Avoids a redundant dict lookup + 'is_muon' guard on
+        # every subsequent step.
+        if not state:
+            self.__init_state(p, group)
 
         is_compiled = group.get('compiled_optimizer', False)
 
@@ -540,6 +551,12 @@ class AdaMuon_adv(torch.optim.Optimizer):
                 # (and after the bias-correction branch) so the dynamic value is
                 # never overwritten by the static `group['adam_betas']`.
                 beta2_adam = self.kourkoutas_helper.get_beta2(p, group)
+                # Accumulate the current grad's norm for the *next* step's
+                # prepare_step(). This MUST happen outside the compiled step
+                # function: the helper mutates Python dict state and keys layers
+                # by id(p), neither of which survives tracing inside a
+                # torch.compile(fullgraph=True) region.
+                self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
 
             if group['adam_use_bias_correction']:
                 sqrt_bias_correction2 = (1.0 - beta2_adam ** current_step)**0.5
@@ -550,7 +567,9 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
             random_int_state_tensor = None
             if is_compiled:
-                step_size = torch.as_tensor(step_size)
+                # Create the scalar on the parameter's device so it does not force
+                # a host-device transfer per step inside the compiled CUDA graph.
+                step_size = torch.as_tensor(step_size, device=p.device)
                 # Cache compiled function per-shape & hyperparameter configuration
                 cache_key = (p.shape, state.get('factored', False), state.get('factored_2nd', False), _adam_group_config(group))
                 if cache_key not in self._compiled_adam_step_fns:
@@ -577,8 +596,11 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
         else: # Muon path
             random_G_sketch = None
+            mars_random_tensor = None
             if is_compiled:
-                lr = torch.as_tensor(group['lr'])
+                # Create the scalar on the parameter's device so it does not force
+                # a host-device transfer per step inside the compiled CUDA graph.
+                lr = torch.as_tensor(group['lr'], device=p.device)
                 # Cache compiled function per-shape & hyperparameter configuration
                 cache_key = (p.shape, state.get('factored', False), state.get('factored_2nd', False), _muon_group_config(group))
                 if cache_key not in self._compiled_muon_step_fns:
@@ -599,15 +621,21 @@ class AdaMuon_adv(torch.optim.Optimizer):
                     random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
                 if group['low_rank_ortho']:
                     random_G_sketch = param_update._get_random_noise_for_low_rank_ortho(p, group['ortho_rank'])
+                if group.get('approx_mars', False) and p.dtype == torch.bfloat16 and self.stochastic_rounding:
+                    # Dedicated random tensor for the MARS last_grad write so it
+                    # does not reuse (and correlate with) the random tensor
+                    # consumed by set_state for the momentum buffers in the same
+                    # compiled step.
+                    mars_random_tensor = param_update._get_random_int_for_sr(p)
             else:
                 lr = group['lr']
                 random_int_state_tensor = None
                 muon_step_param = self._muon_step_parameter
 
-            muon_step_param(step_p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch)
+            muon_step_param(step_p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch, mars_random_tensor)
 
     @torch.no_grad()
-    def _muon_step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch):
+    def _muon_step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch, mars_random_tensor=None):
         original_shape = p.shape
 
         # Upcast grad for low-precision state modes (non-factored path)
@@ -632,11 +660,11 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
         # MARS-M Approximated (Variance Reduction)
         if group.get('approx_mars', False):
-            # If we are on the compiled path and stochastic rounding is enabled,
-            # generate a dedicated random tensor for the last_grad write so it does
-            # not reuse (and correlate with) the random stream used by set_state for
-            # the momentum buffers in the same step.
-            mars_random = random_int_state_tensor
+            # On the compiled path a dedicated random tensor is pre-generated in
+            # step_parameter so the last_grad write does not reuse (and correlate
+            # with) the random stream used by set_state for the momentum buffers
+            # in the same step. On the uncompiled path generate it here.
+            mars_random = mars_random_tensor
             if mars_random is None and self.stochastic_rounding and p.dtype == torch.bfloat16:
                 mars_random = param_update._get_random_int_for_sr(p)
             grad = approx_mars(
@@ -687,7 +715,7 @@ class AdaMuon_adv(torch.optim.Optimizer):
             )
 
             if group['normuon_variant']:
-                normuon_update(update, state['normuon_v'], beta2, group['eps'])
+                normuon_update(update, state['normuon_v'], beta2, adaptive_eps)
             else:
                 # Reconstruct second momentum from previous step's factors
                 vt_buf = _reconstruct_state((state['mu_vbuf_nmf'], state['mv_vbuf_nmf']), signed=False, shifter=state['shifter'])
@@ -748,7 +776,7 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
                 # NorMuon Logic
                 if group['normuon_variant']:
-                    normuon_update(update, state['normuon_v'], beta2, group['eps'])
+                    normuon_update(update, state['normuon_v'], beta2, adaptive_eps)
                 elif factored_2nd:
                     # Factorized second moment: reconstruct → update → re-factorize
                     d1, d2 = state['effective_shape']

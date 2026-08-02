@@ -76,9 +76,12 @@ def _adam_step_parameter(self, p, grad, state, group, beta1_adam, beta2_adam, sq
 
     grad = _orthogonalize_gradient(p, grad, group.get("adam_orthogonal_gradient"))
 
-    if hasattr(self, 'kourkoutas_helper') and self.kourkoutas_helper:
-        # Accumulate current grad's norm for the *next* step
-        self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
+    # NOTE: Kourkoutas-β norm accumulation is intentionally NOT performed here.
+    # This function is (optionally) torch.compiled with fullgraph=True; mutating
+    # the helper's Python dict state and keying layers by id(p) do not survive
+    # tracing inside a compiled region. Callers must invoke
+    # `self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)` from their
+    # (non-compiled) step_parameter instead.
 
     nesterov = group.get('adam_nesterov', False)
     nesterov_coef = group.get('adam_nesterov_coef', None)

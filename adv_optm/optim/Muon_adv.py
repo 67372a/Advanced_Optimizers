@@ -431,6 +431,12 @@ class Muon_adv(torch.optim.Optimizer):
                 # (and after the bias-correction branch) so the dynamic value is
                 # never overwritten by the static `group['adam_betas']`.
                 beta2_adam = self.kourkoutas_helper.get_beta2(p, group)
+                # Accumulate the current grad's norm for the *next* step's
+                # prepare_step(). This MUST happen outside the compiled step
+                # function (Muon_AuxAdam._adam_step_parameter): the helper mutates
+                # Python dict state and keys layers by id(p), neither of which
+                # survives tracing inside a torch.compile(fullgraph=True) region.
+                self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
 
             if group['adam_use_bias_correction']:
                 sqrt_bias_correction2 = (1.0 - beta2_adam ** current_step)**0.5
