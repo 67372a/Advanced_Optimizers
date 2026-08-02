@@ -312,13 +312,16 @@ class Prodigy_adv(torch.optim.Optimizer):
                 state['effective_shape'] = _get_effective_shape(p.numel())
                 d1, d2 = state['effective_shape']
 
+                # Shifter is required by the reconstruction/factorization helpers
+                # for *both* moments, even when betas[0] == 0 (no first moment).
+                state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
+
                 # First moment (m)
                 if group['betas'][0] > 0:
                     state['mu_m_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
                     state['mv_m_nmf'] = torch.zeros(d2, device=device, dtype=torch.float32)
                     packed_d2 = (d2 + 7) // 8
                     state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=device)
-                    state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
 
                 # Second moment (v)
                 state['mu_v_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
@@ -363,7 +366,12 @@ class Prodigy_adv(torch.optim.Optimizer):
             # Get the dynamic beta2 calculated in prepare_step()
             beta2 = self.kourkoutas_helper.get_beta2(p, group)
         else:
-            beta2 = self.beta2_default
+            beta2 = group['betas'][1]
+
+        # Per-group betas: resolve the momentum / D-decay coefficients from this
+        # parameter's own group (previously cached from param_groups[0] only).
+        beta1 = group['betas'][0]
+        beta3 = group['beta3'] if group['beta3'] is not None else math.sqrt(group['betas'][1])
 
         dlr = group['d'] * group['lr']
 
@@ -382,8 +390,30 @@ class Prodigy_adv(torch.optim.Optimizer):
                 random_int_state_tensor = param_update._get_random_int_for_sr(p)
             elif group['actual_state_precision'] == 'int8_sr':
                 random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
-            # Cache compiled function per-shape
-            cache_key = (p.shape, state.get('factored', False))
+            # Cache the compiled function per shape plus the static hyperparameters
+            # that change the traced graph (betas, precisions, feature flags).
+            # Mutable per-step values (d, k, ...) are deliberately excluded and
+            # passed as inputs instead.
+            cache_key = (
+                p.shape,
+                state.get('factored', False),
+                state.get('factored_2nd', False),
+                group['actual_state_precision'],
+                group['betas'][0],
+                group['betas'][1],
+                group['beta3'],
+                group.get('kourkoutas_beta', False),
+                group['use_atan2'],
+                group.get('nesterov', False),
+                group.get('nesterov_coef', None),
+                group.get('fisher_wd', False),
+                group.get('spectral_normalization', False),
+                group.get('safeguard_warmup', False),
+                group['prodigy_steps'],
+                group['d0'],
+                group['slice_p'],
+                group['orthogonal_gradient'],
+            )
             if cache_key not in self._compiled_step_fns:
                 self._compiled_step_fns[cache_key] = torch.compile(
                     self._step_parameter,
@@ -395,11 +425,11 @@ class Prodigy_adv(torch.optim.Optimizer):
             d = group['d']
             step_param_fn = self._step_parameter
 
-        step_param_fn(p, grad, state, group, beta2, d, dlr, random_int_tensor, random_int_state_tensor)
+        step_param_fn(p, grad, state, group, beta2, d, dlr, random_int_tensor, random_int_state_tensor, beta1, beta3)
 
         state['step'] += 1
 
-    def _step_parameter(self, p, grad, state, group, beta2, d, dlr, random_int_tensor, random_int_state_tensor):
+    def _step_parameter(self, p, grad, state, group, beta2, d, dlr, random_int_tensor, random_int_state_tensor, beta1, beta3):
         grad = upcast_grad_for_precision(grad, state, group['state_precision'])
 
         grad = _orthogonalize_gradient(p, grad, group["orthogonal_gradient"])
@@ -423,7 +453,7 @@ class Prodigy_adv(torch.optim.Optimizer):
                 mt = _reconstruct_state((state['mu_m_nmf'], state['mv_m_nmf'], state['sign'], d2), signed=True, shifter=state['shifter'])
 
                 # Update momentum in full-size
-                mt.mul_(self.beta1).add_(grad_reshaped, alpha=d * (1.0 - self.beta1))
+                mt.mul_(beta1).add_(grad_reshaped, alpha=d * (1.0 - beta1))
 
                 # Factorize
                 for key, val in zip(('mu_m_nmf', 'mv_m_nmf', 'sign'), _factorize_state(mt.clone(), signed=True, shifter=state['shifter'])):
@@ -432,7 +462,7 @@ class Prodigy_adv(torch.optim.Optimizer):
                 update_mt = mt
 
                 if nesterov:
-                    nv_coef = self.beta1 if nesterov_coef is None else nesterov_coef
+                    nv_coef = beta1 if nesterov_coef is None else nesterov_coef
                     update_mt = update_mt.lerp_(grad_reshaped, 1-nv_coef)
 
             vt = _reconstruct_state((state['mu_v_nmf'], state['mv_v_nmf']), signed=False, shifter=state['shifter'])
@@ -471,12 +501,12 @@ class Prodigy_adv(torch.optim.Optimizer):
 
             if use_mt:
                 exp_avg = get_state(state, 'exp_avg', actual_precision)
-                exp_avg.mul_(self.beta1).add_(grad, alpha=d * (1.0 - self.beta1))
+                exp_avg.mul_(beta1).add_(grad, alpha=d * (1.0 - beta1))
 
                 update_mt = exp_avg.clone()
 
                 if nesterov:
-                    nv_coef = self.beta1 if nesterov_coef is None else nesterov_coef
+                    nv_coef = beta1 if nesterov_coef is None else nesterov_coef
                     update_mt = update_mt.lerp_(grad, 1-nv_coef)
 
                 set_state(state, 'exp_avg', exp_avg, actual_precision, random_int_state_tensor)
@@ -538,7 +568,7 @@ class Prodigy_adv(torch.optim.Optimizer):
             self.d_numerator.add_((d / d0) * dlr * torch.dot(grad_slice, p0 - p_slice))
 
             alpha = ((d / d0) * d) if safeguard_warmup else ((d / d0) * dlr)
-            s.mul_(self.beta3).add_(grad_slice, alpha=alpha)
+            s.mul_(beta3).add_(grad_slice, alpha=alpha)
             self.d_denom.add_(s.abs().sum())
 
             del s, p0, grad_slice, p_slice, alpha
@@ -593,6 +623,11 @@ class Prodigy_adv(torch.optim.Optimizer):
                     d_hat = min(g_group['d'] * (2 ** 0.25), d_hat)
                 if g_group['d'] == g_group['d0']:
                     g_group['d'] = max(g_group['d'], d_hat)
+                else:
+                    # Reference Prodigy: track d_hat directly once adaptation
+                    # has left d0 (previously d was only ever ratcheted up via
+                    # d_max and never shrank when d_hat collapsed).
+                    g_group['d'] = d_hat
                 d_max = max(d_max, d_hat)
                 g_group['d'] = min(d_max, g_group['d'] * growth_rate)
 
