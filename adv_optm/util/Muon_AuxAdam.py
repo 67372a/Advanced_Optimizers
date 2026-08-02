@@ -120,13 +120,20 @@ def _adam_step_parameter(self, p, grad, state, group, beta1_adam, beta2_adam, sq
         # Factorize
         state['mu_v_nmf'], state['mv_v_nmf'] = _factorize_state(vt, signed=False, shifter=state['shifter'])
 
-        if group.get('adam_use_atan2'):
-            denom = vt.sqrt_()
-            denom.div_(sqrt_bias_correction2)
-            update.atan2_(denom)
+        if isinstance(beta2_adam, torch.Tensor) and beta2_adam.dim() > 0:
+            # Per-row beta2 (e.g. Kourkoutas-β for LoRA/OFT): the bias-correction
+            # factor carries the same per-row layout as beta2_adam. Apply it in
+            # parameter space (exactly like the beta2 update above) so it
+            # broadcasts correctly, then map back to the factored (d1, d2) grid.
+            denom = vt.sqrt_().view_as(p).div_(sqrt_bias_correction2).view_as(grad_reshaped)
         else:
             denom = vt.sqrt_()
-            denom.div_(sqrt_bias_correction2).add_(adaptive_eps)
+            denom.div_(sqrt_bias_correction2)
+
+        if group.get('adam_use_atan2'):
+            update.atan2_(denom)
+        else:
+            denom.add_(adaptive_eps)
             update.div_(denom)
 
         wd_scaler = _get_fisher_wd_scaler(group, state.get("wd_scaler"), p, denom, group.get('adam_use_atan2'))
