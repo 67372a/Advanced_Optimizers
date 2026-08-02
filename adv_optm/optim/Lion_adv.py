@@ -97,6 +97,13 @@ class Lion_adv(torch.optim.Optimizer):
             raise ValueError(f"Betas should be in [0.0, 1.0], but got {betas}")
         if not weight_decay >= 0.0:
             raise ValueError(f"Weight decay must be >= 0.0, but got {weight_decay}")
+        if orthogonal_gradient not in ('disabled', 'flattened', 'iterative'):
+            raise ValueError(
+                f"orthogonal_gradient must be one of 'disabled', 'flattened', 'iterative'. "
+                f"Got {orthogonal_gradient}"
+            )
+        if not auto_kappa_p and not (1.0 <= kappa_p <= 2.0):
+            raise ValueError(f"kappa_p must be in [1.0, 2.0], but got {kappa_p}")
 
         defaults = dict(
             lr=lr,
@@ -112,6 +119,7 @@ class Lion_adv(torch.optim.Optimizer):
             nnmf_factor=nnmf_factor,
             centered_wd= centered_wd,
             centered_wd_mode= centered_wd_mode,
+            compiled_optimizer=compiled_optimizer,
         )
         self.stochastic_rounding = stochastic_rounding
         self._init_lr = lr if lr > 0 else 1
@@ -169,6 +177,11 @@ class Lion_adv(torch.optim.Optimizer):
                 not (len(p.shape) == 1 and not group['vector_reshape'])
             )
 
+            # Expose the effective state precision so that
+            # post_process_loaded_state / fix_loaded_state_dtype can restore
+            # dtypes correctly after load_state_dict (see state_util).
+            group['actual_state_precision'] = 'factored' if state['factored'] else 'auto'
+
             dtype = torch.float32 if state['factored'] else p.dtype
 
             if state['factored']:
@@ -194,11 +207,10 @@ class Lion_adv(torch.optim.Optimizer):
             return
 
         grad = p.grad
-        # Defensive copy: the step function applies in-place sign/normalization to
-        # the gradient. For fp32 grads upcast_grad_for_precision returns the same
-        # buffer, so clone here to avoid ever mutating the user's p.grad.
-        if grad.dtype == torch.float32:
-            grad = grad.clone()
+        # Defensive copy: the step function applies in-place sign/normalization
+        # to the gradient (e.g. OrthoGrad 'iterative' mutates through tensor
+        # views). Clone for EVERY dtype so the user's p.grad is never mutated.
+        grad = grad.clone()
         state = self.state[p]
         self.__init_state(p, group)
 
@@ -209,14 +221,25 @@ class Lion_adv(torch.optim.Optimizer):
         random_noise_tensor = None
 
         if group.get('compiled_optimizer', False):
+            # Pre-generate random tensors in the SAME order as the uncompiled
+            # path (stochastic-sign noise first, then stochastic-rounding ints)
+            # so both paths keep identical deterministic RNG streams. The SSO
+            # noise dtype must match what the uncompiled path would draw (fp32
+            # in the factored path, p.dtype otherwise) for bit-exact parity.
+            if group.get('stochastic_sign', False):
+                noise_dtype = torch.float32 if state.get('factored', False) else p.dtype
+                random_noise_tensor = torch.rand(
+                    p.shape,
+                    device=p.device,
+                    dtype=noise_dtype,
+                    generator=param_update.get_generator(p.device),
+                ).mul_(2).sub_(1)
             if p.dtype == torch.bfloat16 and self.stochastic_rounding:
                 # Pre-generate random tensor for stochastic rounding if needed.
                 random_int_tensor = param_update._get_random_int_for_sr(p)
-            if group.get('stochastic_sign', False):
-                random_noise_tensor = param_update._get_random_noise_for_sso(p)
             lr = torch.as_tensor(lr)
-            # Cache compiled function per-shape
-            cache_key = (p.shape, state.get('factored', False))
+            # Cache compiled function per-shape/dtype/device
+            cache_key = (p.shape, p.dtype, p.device, state.get('factored', False))
             if cache_key not in self._compiled_step_fns:
                 self._compiled_step_fns[cache_key] = torch.compile(
                     self._step_parameter,
