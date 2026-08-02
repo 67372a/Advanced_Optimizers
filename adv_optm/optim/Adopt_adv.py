@@ -189,7 +189,14 @@ class Adopt_adv(torch.optim.Optimizer):
 
         self.init_step()
 
-        if self.kourkoutas_beta:
+        # Create the Kourkoutas helper if the constructor-level flag is set OR
+        # if any param group enables kourkoutas_beta. step_parameter() guards on
+        # the *per-group* flag, so the helper must exist in both cases, otherwise
+        # an AttributeError is raised on the first step.
+        kourkoutas_enabled = self.kourkoutas_beta or any(
+            group.get('kourkoutas_beta', False) for group in self.param_groups
+        )
+        if kourkoutas_enabled:
             self.kourkoutas_helper = KourkoutasHelper(self)
 
         if self.stochastic_rounding:
@@ -250,13 +257,18 @@ class Adopt_adv(torch.optim.Optimizer):
                 state['effective_shape'] = _get_effective_shape(p.numel())
                 d1, d2 = state['effective_shape']
 
+                # The shifter is passed to _reconstruct_state/_factorize_state for
+                # BOTH the (unsigned) second moment and the (signed) first moment,
+                # so it must always exist - even when betas[0] == 0 (no momentum),
+                # which previously raised KeyError('shifter') on the first update.
+                state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
+
                 # First moment (m)
                 if group['betas'][0] > 0:
                     state['mu_m_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
                     state['mv_m_nmf'] = torch.zeros(d2, device=device, dtype=torch.float32)
                     packed_d2 = (d2 + 7) // 8
                     state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=device)
-                    state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
 
                 # Second moment (v)
                 state['mu_v_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
@@ -407,7 +419,11 @@ class Adopt_adv(torch.optim.Optimizer):
             else:
                 normalized_grad = torch.div(grad_reshaped, denom.add_(adaptive_eps), out=denom)
                 if self.clip_lambda is not None:
-                    clip_val = self.clip_lambda(state['step'])
+                    # state['step'] can be 0 on the very first update when
+                    # use_atan2/spectral_normalization skip the init-only first
+                    # step. clip_lambda(0) == 0 would clamp the entire first
+                    # update to zero, so always index the clip from step 1.
+                    clip_val = self.clip_lambda(max(state['step'], 1))
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t using normalized gradient
@@ -454,7 +470,10 @@ class Adopt_adv(torch.optim.Optimizer):
             else:
                 normalized_grad = torch.div(grad, denom.add_(adaptive_eps), out=denom)
                 if self.clip_lambda is not None:
-                    clip_val = self.clip_lambda(state['step'])
+                    # See comment in the factored branch: the first real update
+                    # (use_atan2/spectral_normalization) has state['step'] == 0
+                    # and clip_lambda(0) == 0 would zero out the whole update.
+                    clip_val = self.clip_lambda(max(state['step'], 1))
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t
