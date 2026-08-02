@@ -37,13 +37,16 @@ def _init_auxadam_state(self, p, group):
     if state['factored']:
         state['effective_shape'] = _get_effective_shape(p.numel())
         d1, d2 = state['effective_shape']
+        # Shifter is used by both the signed first-moment and the unsigned
+        # second-moment factor paths, so it must be created even when beta1 == 0
+        # (otherwise _adam_step_parameter hits KeyError('shifter')).
+        state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
         # First moment (m)
         if group['adam_betas'][0] > 0:
             state['mu_m_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
             state['mv_m_nmf'] = torch.zeros(d2, device=device, dtype=torch.float32)
             packed_d2 = (d2 + 7) // 8
             state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=device)
-            state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
         # Second moment (v)
         state['mu_v_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
         state['mv_v_nmf'] = torch.zeros(d2, device=device, dtype=torch.float32)

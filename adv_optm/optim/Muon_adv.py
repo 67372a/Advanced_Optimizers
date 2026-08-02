@@ -417,19 +417,24 @@ class Muon_adv(torch.optim.Optimizer):
 
             beta1_adam, beta2_adam = group['adam_betas']
 
+            if group['adam_use_bias_correction']:
+                current_step = step + 1
+                bias_correction1 = 1.0 - beta1_adam ** current_step
+            else:
+                bias_correction1 = 1.0
+
             if self.kourkoutas_helper:
                 # Prepare Kourkoutas-β once per optimizer step.
                 self.kourkoutas_helper.maybe_prepare_step(step, p.device)
-                # Get the dynamic beta2_adam calculated in prepare_step()
+                # Get the dynamic beta2_adam calculated in prepare_step().
+                # This must be fetched AFTER the static defaults are unpacked
+                # (and after the bias-correction branch) so the dynamic value is
+                # never overwritten by the static `group['adam_betas']`.
                 beta2_adam = self.kourkoutas_helper.get_beta2(p, group)
 
             if group['adam_use_bias_correction']:
-                current_step = step + 1
-                beta1_adam, beta2_adam = group['adam_betas']
-                bias_correction1 = 1.0 - beta1_adam ** current_step
                 sqrt_bias_correction2 = (1.0 - beta2_adam ** current_step)**0.5
             else:
-                bias_correction1 = 1.0
                 sqrt_bias_correction2 = 1.0
 
             step_size = group['lr'] / bias_correction1

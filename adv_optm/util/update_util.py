@@ -3,7 +3,11 @@ import torch
 import math
 
 def _init_fisher_wd_scaler(group: dict, state: dict, p: torch.Tensor) -> torch.Tensor | None:
-    if not group.get('fisher_wd', False):
+    # Hybrid optimizers (Muon_adv / AdaMuon_adv) store the flag as
+    # 'adam_fisher_wd' on the shared group; plain optimizers use 'fisher_wd'.
+    # OR semantics keep the aliases independent of whether the other key is
+    # present with a default False value.
+    if not (group.get('fisher_wd', False) or group.get('adam_fisher_wd', False)):
         return
 
     state["wd_scaler"] = torch.tensor(1.0, device=p.device)
@@ -16,7 +20,11 @@ def _get_fisher_wd_scaler(group: dict, stored_scaler: torch.Tensor, p: torch.Ten
     From the paper:
     "FAdam: Adam is a natural gradient optimizer using diagonal empirical Fisher information"
     """
-    if not group.get('fisher_wd', False):
+    # Hybrid optimizers (Muon_adv / AdaMuon_adv) store the flag as
+    # 'adam_fisher_wd' on the shared group; plain optimizers use 'fisher_wd'.
+    # OR semantics keep the aliases independent of whether the other key is
+    # present with a default False value.
+    if not (group.get('fisher_wd', False) or group.get('adam_fisher_wd', False)):
         return None
 
     if atan2:
