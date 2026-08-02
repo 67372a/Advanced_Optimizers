@@ -288,9 +288,40 @@ def _is_suitable_for_muon(
         max_aspect_ratio: float = 128.,
 ) -> bool:
     """Check if a parameter is suitable for Muon optimization.
+
+    In addition to shape heuristics, this honors layer markers set by network
+    libraries (PEFT / diffusers / timm-style). Markers are read via `getattr`
+    and only affect auto-detection; an explicit `use_muon` in the parameter
+    group still overrides.
+
+    Marker semantics:
+      - `_is_dora_scale`, `_is_oft`, `is_vector`: adapter / 1D params with no
+        matrix geometry that benefits from Muon orthogonalization -> always
+        routed to AdamW.
+      - `is_hidden=False`: explicit opt-out for non-hidden layers (embeddings,
+        heads, norms) -> AdamW. Defaults to True when unset.
+      - `is_hidden=True`: explicit opt-in; bypasses the `min_dim_size` /
+        `max_aspect_ratio` threshold checks only. The structural (2D+) and
+        unit-dim validity rules below still apply.
+      - `_is_lora_A` / `_is_lora_B` receive no special treatment here; they
+        are subject to the other flags and the shape checks below.
+
     modified from:
     https://github.com/huggingface/pytorch-image-models/blob/main/timm/optim/muon.py#L167
     """
+
+    # Network-library adapter / vector markers: always route to AdamW.
+    # (LoRA factors are deliberately NOT excluded here; see docstring.)
+    if (
+        getattr(param, '_is_dora_scale', False)
+        or getattr(param, '_is_oft', False)
+        or getattr(param, 'is_vector', False)
+    ):
+        return False
+
+    # Explicit opt-out: non-hidden layers (embeddings, heads, norms).
+    if not getattr(param, 'is_hidden', True):
+        return False
 
     s = param.shape
     # Must have at least 2 non-unit dimensions
@@ -298,11 +329,20 @@ def _is_suitable_for_muon(
         return False
 
     # Unit dimension in first two positions indicates:
-    # - Position embeddings (1, seq, dim)
-    # - Depthwise convs (out, 1, h, w)
+    # - Position embeddings (1, seq, dim): rank-1 after flatten -> NS degenerate
+    # - Depthwise convs (out, 1, h, w): diagonal channel coupling
     # - Other degenerate cases possibly not caught by first rule
+    # These are geometric validity rules and remain active even when
+    # is_hidden=True; the opt-in below only bypasses the quality thresholds.
     if s[0] == 1 or s[1] == 1:
         return False
+
+    # Explicit opt-in: hidden-layer weights always use Muon, bypassing the
+    # min_dim_size / max_aspect_ratio threshold checks below. Guaranteed 2D+
+    # with no unit leading dims (see the checks above) because the Muon step
+    # path has no degenerate/1D code branch.
+    if getattr(param, 'is_hidden', False):
+        return True
 
     if param.ndim >= 3:
         # For 3D+ tensors, check what dimensions will be AFTER flattening
