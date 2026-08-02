@@ -110,8 +110,12 @@ class SignSGD_adv(torch.optim.Optimizer):
             raise ValueError(f"momentum should be in [0.0, 1.0], but got {momentum}")
         if not weight_decay >= 0.0:
             raise ValueError(f"Weight decay must be >= 0.0, but got {weight_decay}")
-        if snr_cond and not normed_momentum and not momentum > 0:
-            raise NotImplementedError(f"snr_cond is intended to be used with normed_momentum")
+        if nesterov_coef is not None and not (0.0 <= nesterov_coef <= 1.0):
+            raise ValueError(f"nesterov_coef should be in [0.0, 1.0] or None. Got {nesterov_coef}")
+        if orthogonal_gradient not in ('disabled', 'flattened', 'iterative'):
+            raise ValueError(f"orthogonal_gradient must be one of 'disabled', 'flattened', 'iterative'. Got {orthogonal_gradient}")
+        if snr_cond and (not normed_momentum or momentum <= 0.0):
+            raise NotImplementedError("snr_cond is intended to be used with normed_momentum and momentum > 0.")
 
         state_precision = state_precision.lower()
         valid_precisions = {"auto", "fp32", "factored", "bf16_sr", "fp16", "int8_sr"}
@@ -192,7 +196,16 @@ class SignSGD_adv(torch.optim.Optimizer):
         # State Initialization
         if 'step' not in state:
             req_precision = group['state_precision']
-            is_vector = len(p.shape) == 1 and not group['vector_reshape']
+            # Keep the is_vector definition identical to the one used at step
+            # time (see step_parameter / _step_parameter) so state allocation
+            # matches the runtime branches. 0-dim (scalar) tensors are ALWAYS
+            # treated as vectors since a meaningful 2D reshape does not exist.
+            is_vector = (
+                (len(p.shape) < 2 and not group['vector_reshape'])
+                or len(p.shape) == 0
+                or getattr(p, '_is_dora_scale', False)
+                or getattr(p, 'is_vector', False)
+            )
 
             state['factored'] = req_precision == 'factored' and not is_vector
 
@@ -241,27 +254,47 @@ class SignSGD_adv(torch.optim.Optimizer):
         random_noise_tensor = None
         random_int_state_tensor = None
 
-        is_vector = p.ndim < 2 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
+        is_vector = (
+            (p.ndim < 2 and not group.get('vector_reshape', False))
+            or p.ndim == 0
+            or getattr(p, '_is_dora_scale', False)
+            or getattr(p, 'is_vector', False)
+        )
 
         if group.get('compiled_optimizer', False):
-            if p.dtype == torch.bfloat16 and self.stochastic_rounding:
+            # Pre-generate random tensors in the SAME order as the uncompiled
+            # path so both paths keep identical deterministic RNG streams:
+            #   normed_momentum : SSO noise -> state SR -> parameter SR
+            #   else            : state SR  -> SSO noise -> parameter SR
+            # The state and parameter SR tensors must be INDEPENDENT: reusing
+            # one tensor for both would correlate the two rounding operations
+            # and corrupt stream parity (see SinkSGD_adv for the same fix).
+            sso_draw = (
+                group.get('stochastic_sign', False)
+                and not is_vector
+                and p.ndim >= 2  # apply_stochastic_sign_ never draws for 1D/0-dim
+            )
+            has_state = group.get('momentum', 0) > 0 and not state.get('factored', False)
+            state_draw = has_state and group['actual_state_precision'] in ('bf16_sr', 'int8_sr')
+            param_draw = p.dtype == torch.bfloat16 and self.stochastic_rounding
+
+            if group.get('normed_momentum', False) and sso_draw:
+                random_noise_tensor = param_update._get_random_noise_for_sso(p)
+            if state_draw:
+                if group['actual_state_precision'] == 'bf16_sr':
+                    random_int_state_tensor = param_update._get_random_int_for_sr(p)
+                else:
+                    random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
+            if not group.get('normed_momentum', False) and sso_draw:
+                random_noise_tensor = param_update._get_random_noise_for_sso(p)
+            if param_draw:
                 # Pre-generate random tensor for stochastic rounding if needed.
                 random_int_tensor = param_update._get_random_int_for_sr(p)
-                random_int_state_tensor = random_int_tensor
-
-            if group.get('momentum', 0) > 0 and not state.get('factored', False):
-                if group['actual_state_precision'] == 'bf16_sr' and random_int_state_tensor is None:
-                    random_int_state_tensor = param_update._get_random_int_for_sr(p)
-                elif group['actual_state_precision'] == 'int8_sr':
-                    random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
-
-            if group.get('stochastic_sign', False) and not is_vector:
-                random_noise_tensor = param_update._get_random_noise_for_sso(p)
 
             lr = torch.as_tensor(lr)
 
-            # Cache compiled function per-shape
-            cache_key = (p.shape, state.get('factored', False))
+            # Cache compiled function per-shape/dtype/device
+            cache_key = (p.shape, p.dtype, p.device, state.get('factored', False))
             if cache_key not in self._compiled_step_fns:
                 self._compiled_step_fns[cache_key] = torch.compile(
                     self._step_parameter,
@@ -279,7 +312,15 @@ class SignSGD_adv(torch.optim.Optimizer):
     def _step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_noise_tensor, random_int_state_tensor=None):
         grad = upcast_grad_for_precision(grad, state, group['state_precision'])
 
-        is_vector = grad.ndim < 2 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
+        # Keep the is_vector definition identical to the one used in
+        # step_parameter / __init_state so state allocation matches the runtime
+        # branches. 0-dim (scalar) tensors are always treated as vectors.
+        is_vector = (
+            (grad.ndim < 2 and not group.get('vector_reshape', False))
+            or grad.ndim == 0
+            or getattr(p, '_is_dora_scale', False)
+            or getattr(p, 'is_vector', False)
+        )
 
         momentum = group["momentum"]
         nesterov = group.get('nesterov', False)
@@ -382,10 +423,10 @@ class SignSGD_adv(torch.optim.Optimizer):
                 cwd_target = get_signsgd_wd_target(p.sub(anchor), denom=denom, stochastic_sign=sso, noise=random_noise_tensor, is_vector=is_vector)
                 del anchor
 
+        update_scaling = lr * A if snr_cond else lr
         if group.get('spectral_normalization', False):
-            update = scale_update(p, update, lr, state=state)
+            update = scale_update(p, update, update_scaling, state=state)
         else:
-            update_scaling = lr * A if snr_cond else lr
             update.mul_(update_scaling)
 
         param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor, wd_target=wd_target, cwd_target=cwd_target)
