@@ -146,12 +146,17 @@ class AdamW_adv(torch.optim.Optimizer):
             raise ValueError(f"Learning-rate should be >= 0.0. Got {lr}")
         if not (0.0 <= betas[0] < 1.0 and 0.0 <= betas[1] < 1.0):
             raise ValueError(f"Betas should be in [0.0, 1.0). Got {betas}")
-        if not (eps >= 0.0):
-            raise ValueError(f"Epsilon should be >= 0.0. Got {eps}")
+        if eps is not None and not (eps >= 0.0):
+            raise ValueError(f"Epsilon should be >= 0.0 or None for scale-invariant eps. Got {eps}")
         if not (weight_decay >= 0.0):
             raise ValueError(f"Weight-decay should be >= 0.0. Got {weight_decay}")
         if kourkoutas_beta and not (betas[1] > beta2_min):
             raise ValueError(f"For Kourkoutas-β, betas[1] (as beta2_max) must be > beta2_min. Got {betas[1]} and {beta2_min}")
+        if orthogonal_gradient not in ('disabled', 'flattened', 'iterative'):
+            raise ValueError(
+                f"orthogonal_gradient must be one of 'disabled', 'flattened', 'iterative'. "
+                f"Got {orthogonal_gradient}"
+            )
 
         state_precision = state_precision.lower()
         valid_precisions = {"auto", "fp32", "factored", "bf16_sr", "fp16", "int8_sr"}
@@ -184,7 +189,16 @@ class AdamW_adv(torch.optim.Optimizer):
 
         self.init_step()
 
-        if self.kourkoutas_beta:
+        # Instantiate the Kourkoutas helper if any param group requests dynamic
+        # beta2. The optimizer-level flag propagates to all groups via defaults,
+        # but groups may also enable it individually; without this check a
+        # group-level override would crash on step (self.kourkoutas_helper
+        # missing).
+        any_kourkoutas_group = any(
+            group.get('kourkoutas_beta', False) or group.get('adam_kourkoutas_beta', False)
+            for group in self.param_groups
+        )
+        if any_kourkoutas_group:
             self.kourkoutas_helper = KourkoutasHelper(self)
 
         if self.stochastic_rounding:
